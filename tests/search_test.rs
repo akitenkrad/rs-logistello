@@ -141,22 +141,28 @@ fn tt_does_not_change_value() {
 #[test]
 fn killers_and_tt_do_not_change_value() {
     let mut rng = ChaCha20Rng::seed_from_u64(0x5EED_9999);
+    // ProbCut left at its default (OFF) for every config: these are the
+    // Phase 2 soundness invariants and must hold byte-identically.
     let configs = [
         SearchConfig {
             use_tt: true,
             use_killers: true,
+            ..SearchConfig::default()
         },
         SearchConfig {
             use_tt: true,
             use_killers: false,
+            ..SearchConfig::default()
         },
         SearchConfig {
             use_tt: false,
             use_killers: true,
+            ..SearchConfig::default()
         },
         SearchConfig {
             use_tt: false,
             use_killers: false,
+            ..SearchConfig::default()
         },
     ];
     for trial in 0..50u64 {

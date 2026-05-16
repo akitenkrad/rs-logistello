@@ -24,6 +24,7 @@ use crate::alphabeta::SearchConfig;
 use crate::endgame::{best_endgame_move, solve_wld};
 use crate::iterative::{SearchResult, search_with};
 use crate::killer::KillerTable;
+use crate::probcut::ProbCutConfig;
 use crate::tt::TranspositionTable;
 
 /// Default empty-square threshold below which exact endgame play kicks in
@@ -46,6 +47,10 @@ pub struct EngineConfig {
     pub use_tt: bool,
     /// Use killer-move ordering.
     pub use_killers: bool,
+    /// Single-ProbCut configuration (design doc §4.3.4 / §4.5 B7).
+    /// [`ProbCutConfig::default`] is **disabled** so the default engine is
+    /// exactly the Phase 3 selective-midgame search.
+    pub probcut: ProbCutConfig,
 }
 
 impl Default for EngineConfig {
@@ -55,6 +60,7 @@ impl Default for EngineConfig {
             endgame_empties: DEFAULT_ENDGAME_EMPTIES,
             use_tt: true,
             use_killers: true,
+            probcut: ProbCutConfig::default(),
         }
     }
 }
@@ -66,6 +72,8 @@ impl EngineConfig {
         SearchConfig {
             use_tt: self.use_tt,
             use_killers: self.use_killers,
+            // ProbCut wired through the engine config (design doc §4.5 B7).
+            probcut: self.probcut,
         }
     }
 }

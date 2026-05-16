@@ -12,6 +12,8 @@ othello-core.workspace = true
 othello-player.workspace = true
 logistello-core.workspace = true
 logistello-eval.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

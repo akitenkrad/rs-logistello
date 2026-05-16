@@ -5,6 +5,7 @@
 //! returns success.
 
 use logistello_cli::extract;
+use logistello_cli::probcut_fit;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -12,10 +13,13 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
+use logistello_core::Zobrist;
 use logistello_core::perft::perft_standard;
 use logistello_eval::{DiscDiffEval, EvalWeights};
-use logistello_search::iterative::search;
-use logistello_search::{EngineConfig, LogistelloPlayer};
+use logistello_search::alphabeta::{INF, SearchConfig, SearchContext, negascout};
+use logistello_search::killer::KillerTable;
+use logistello_search::tt::TranspositionTable;
+use logistello_search::{EngineConfig, LogistelloPlayer, ProbCutConfig};
 use othello_core::{Color, GameState, Move};
 use othello_engine::{EngineConfig as GameEngineConfig, GameEngine};
 use othello_player::{GreedyPlayer, Player, RandomPlayer};
@@ -62,13 +66,58 @@ enum Command {
         /// the Phase 3 `BasicEval` (design doc §4.3.3 / §4.4 B1-B4).
         #[arg(long)]
         eval_weights: Option<PathBuf>,
+        /// Enable single ProbCut for the `engine` player (design doc
+        /// §4.3.4 / §4.5 B7). Off by default. Use `--no-probcut` to force
+        /// it off explicitly.
+        #[arg(long, overrides_with = "no_probcut", default_value_t = false)]
+        probcut: bool,
+        /// Explicitly disable ProbCut (the default; provided so it can
+        /// override an earlier `--probcut`).
+        #[arg(long)]
+        no_probcut: bool,
+        /// ProbCut per-σ confidence `T` (design doc §4.5 B7: 1.5).
+        #[arg(long, default_value_t = 1.5)]
+        probcut_t: f64,
+        /// ProbCut params JSON (a `probcut-fit` output). Required for a
+        /// meaningful `--probcut` run (the built-in default has no fitted
+        /// coefficients, so ProbCut would just fall through).
+        #[arg(long)]
+        probcut_params: Option<PathBuf>,
     },
     /// Benchmark the Phase 2 search from the standard opening using the
-    /// trivial disc-difference evaluator (one working end-to-end path).
+    /// trivial disc-difference evaluator. `--probcut` runs the same nominal
+    /// depth with single ProbCut enabled so the speedup vs the exact search
+    /// is observable (`probcut_speedup`, design doc §4.3.8 / §5).
     BenchSearch {
         /// Maximum iterative-deepening depth (plies).
         #[arg(long, default_value_t = 8)]
         depth: u32,
+        /// Enable single ProbCut at the same nominal depth (design doc
+        /// §4.3.4 / §4.5 B7). Off by default.
+        #[arg(long, overrides_with = "no_probcut", default_value_t = false)]
+        probcut: bool,
+        /// Explicitly disable ProbCut (the default).
+        #[arg(long)]
+        no_probcut: bool,
+        /// ProbCut per-σ confidence `T` (design doc §4.5 B7: 1.5).
+        #[arg(long, default_value_t = 1.5)]
+        probcut_t: f64,
+        /// ProbCut params JSON (a `probcut-fit` output).
+        #[arg(long)]
+        probcut_params: Option<PathBuf>,
+        /// Run BOTH a ProbCut-off and a ProbCut-on search at `--depth` from
+        /// the same position and report the `probcut_speedup`
+        /// (nodes/time ratio; design doc §4.3.8 / §5). Implies a
+        /// `--probcut-params` file for the on-run.
+        #[arg(long, default_value_t = false)]
+        speedup: bool,
+        /// Plies of seeded random play before benchmarking (a midgame
+        /// position exercises h=8 ProbCut nodes; 0 = standard opening).
+        #[arg(long, default_value_t = 0)]
+        from_plies: usize,
+        /// Seed for the `--from-plies` random walk.
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
     },
     /// Run self-play games for data generation (Phase 4).
     Selfplay,
@@ -97,8 +146,43 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Fit ProbCut (a, b, sigma) parameters (Phase 5).
-    ProbcutFit,
+    /// Fit single-ProbCut `(a, b, σ)` coefficients (Phase 5; design doc
+    /// §4.3.4 / §4.5 B7). For every sampled position it measures
+    /// `v_d = NegaScout(d)` and `v_h = NegaScout(h)` under the production TT
+    /// discipline (ProbCut OFF), stratifies by disc phase (`< 36` vs
+    /// `≥ 36`), fits OLS `v_h = a·v_d + b` per phase, and writes a
+    /// `ProbCutConfig`-compatible JSON file.
+    ProbcutFit {
+        /// Shallow:deep depth pair `d:h` (design doc §4.5 B7 single
+        /// ProbCut = `4:8`).
+        #[arg(long, default_value = "4:8")]
+        single_pair: String,
+        /// Corpus: `selfplay` (seeded `RandomPlayer` self-play, no external
+        /// data) or `wthor` (real `.wtb` expert games).
+        #[arg(long, default_value = "selfplay")]
+        source: String,
+        /// Directory with `.wtb` files (required for `--source wthor`).
+        #[arg(long)]
+        wthor_dir: Option<PathBuf>,
+        /// Number of sample positions to fit on.
+        #[arg(long, default_value_t = 5000)]
+        samples: usize,
+        /// Self-play RNG seed (deterministic).
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Optional `LGW1` learned-weight file: fit with `PatternEval`
+        /// instead of `BasicEval` (design doc §4.5 B7 targets R² > 0.96
+        /// with the pattern evaluator).
+        #[arg(long)]
+        eval_weights: Option<PathBuf>,
+        /// Per-σ confidence `T` written into the config (design doc §4.5
+        /// B7: 1.5).
+        #[arg(long, default_value_t = 1.5)]
+        probcut_t: f64,
+        /// Output JSON path (`ProbCutConfig`-compatible).
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Replay a recorded match (e.g. Murakami 1997) (Phase 9).
     MatchReplay,
     /// Estimate ELO versus Edax at various levels (Phase 9).
@@ -202,6 +286,106 @@ fn make_player(
     }
 }
 
+/// Builds the [`ProbCutConfig`] for a CLI run.
+///
+/// `--no-probcut` / the default keeps ProbCut OFF (Phase 2/3 behaviour
+/// unchanged). `--probcut` turns it on; if `--probcut-params FILE` is given
+/// the fitted coefficients are loaded from it (and `T` overridden by
+/// `--probcut-t`), otherwise the built-in canonical-but-unfitted config is
+/// used (which simply falls through — a warning is printed).
+fn build_probcut(
+    enable: bool,
+    no_probcut: bool,
+    t: f64,
+    params: Option<&PathBuf>,
+) -> Result<ProbCutConfig> {
+    if no_probcut || !enable {
+        return Ok(ProbCutConfig::default()); // OFF
+    }
+    let mut cfg = match params {
+        Some(p) => ProbCutConfig::load_json(p)
+            .map_err(|e| anyhow::anyhow!("load probcut params {}: {e}", p.display()))?,
+        None => {
+            eprintln!(
+                "warning: --probcut without --probcut-params: no fitted \
+                 coefficients, ProbCut will fall through to the exact search"
+            );
+            ProbCutConfig::default()
+        }
+    };
+    cfg.enabled = true;
+    cfg.t = t;
+    Ok(cfg)
+}
+
+/// Parses a `d:h` depth pair string.
+fn parse_pair(s: &str) -> Result<(u32, u32)> {
+    let mut it = s.split(':');
+    let d = it
+        .next()
+        .and_then(|x| x.trim().parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("bad --single-pair '{s}' (want d:h)"))?;
+    let h = it
+        .next()
+        .and_then(|x| x.trim().parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("bad --single-pair '{s}' (want d:h)"))?;
+    if it.next().is_some() {
+        bail!("--single-pair '{s}' has too many ':' parts (want d:h)");
+    }
+    if d >= h {
+        bail!("--single-pair d:h needs d < h (got {d}:{h})");
+    }
+    Ok((d, h))
+}
+
+/// Random-walk `plies` placement moves from the standard start (seeded;
+/// forced passes followed transparently per §4.5 B6).
+fn walk_position(plies: usize, seed: u64) -> GameState {
+    use rand::SeedableRng;
+    use rand::seq::SliceRandom;
+    use rand_chacha::ChaCha20Rng;
+    let mut rng = ChaCha20Rng::seed_from_u64(seed);
+    let mut s = GameState::standard_8x8();
+    let mut made = 0;
+    while made < plies {
+        if s.is_terminal() {
+            break;
+        }
+        let mv = s.legal_moves();
+        if mv.is_empty() {
+            s.apply_move(Move::Pass).expect("pass legal when stuck");
+            continue;
+        }
+        let m = *mv.choose(&mut rng).expect("non-empty");
+        s.apply_move(m).expect("legal move applies");
+        made += 1;
+    }
+    s
+}
+
+/// One fixed-depth NegaScout from `root` with the given ProbCut config,
+/// returning `(value, nodes, elapsed_secs)`.
+fn bench_one(root: &GameState, depth: u32, pc: ProbCutConfig) -> (i32, u64, f64) {
+    let mut tt = TranspositionTable::new();
+    let mut killers = KillerTable::new();
+    let z = Zobrist::new();
+    let cfg = SearchConfig {
+        probcut: pc,
+        ..SearchConfig::default()
+    };
+    let mut ctx = SearchContext {
+        evaluator: &DiscDiffEval,
+        tt: &mut tt,
+        killers: &mut killers,
+        zobrist: &z,
+        config: cfg,
+        nodes: 0,
+    };
+    let start = Instant::now();
+    let v = negascout(&mut ctx, root, -INF, INF, depth, 0);
+    (v, ctx.nodes, start.elapsed().as_secs_f64())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -213,10 +397,16 @@ fn main() -> Result<()> {
             endgame_empties,
             seed,
             eval_weights,
+            probcut,
+            no_probcut,
+            probcut_t,
+            probcut_params,
         } => {
+            let pc = build_probcut(probcut, no_probcut, probcut_t, probcut_params.as_ref())?;
             let cfg = EngineConfig {
                 max_depth: depth,
                 endgame_empties,
+                probcut: pc,
                 ..EngineConfig::default()
             };
             let learned = match &eval_weights {
@@ -251,9 +441,15 @@ fn main() -> Result<()> {
                 Some(p) => format!("pattern({})", p.display()),
                 None => "basic".to_string(),
             };
+            let pc_kind = if pc.enabled {
+                format!("on(T={},d={},h={})", pc.t, pc.d, pc.h)
+            } else {
+                "off".to_string()
+            };
             println!(
                 "play black={black} white={white} depth={depth} \
-                 endgame_empties={endgame_empties} seed={seed} eval={eval_kind}"
+                 endgame_empties={endgame_empties} seed={seed} eval={eval_kind} \
+                 probcut={pc_kind}"
             );
             println!("moves: {}", moves.join(" "));
             println!(
@@ -261,34 +457,61 @@ fn main() -> Result<()> {
                 result.black, result.white
             );
         }
-        Command::BenchSearch { depth } => {
-            let root = GameState::standard_8x8();
-            let start = Instant::now();
-            let result = search(&root, depth, &DiscDiffEval);
-            let elapsed = start.elapsed();
-            let best = match result.best_move {
-                Move::Pass => "pass".to_string(),
-                Move::Place(c) => {
-                    // Algebraic: column letter (a-h) + row digit (1-8).
-                    let file = (b'a' + c.col) as char;
-                    let rank = c.row + 1;
-                    format!("{file}{rank}")
+        Command::BenchSearch {
+            depth,
+            probcut,
+            no_probcut,
+            probcut_t,
+            probcut_params,
+            speedup,
+            from_plies,
+            seed,
+        } => {
+            let root = walk_position(from_plies, seed);
+            let nps = |nodes: u64, secs: f64| -> u64 {
+                if secs > 0.0 {
+                    (nodes as f64 / secs) as u64
+                } else {
+                    0
                 }
             };
-            let nps = if elapsed.as_secs_f64() > 0.0 {
-                (result.nodes as f64 / elapsed.as_secs_f64()) as u64
+
+            if speedup {
+                // probcut_speedup (design doc §4.3.8 / §5): same nominal
+                // depth, ProbCut OFF vs ON, same root.
+                let off = ProbCutConfig::default();
+                let on = build_probcut(true, false, probcut_t, probcut_params.as_ref())?;
+                let (v_off, n_off, t_off) = bench_one(&root, depth, off);
+                let (v_on, n_on, t_on) = bench_one(&root, depth, on);
+                let node_ratio = n_on as f64 / (n_off.max(1) as f64);
+                let time_speedup = if t_on > 0.0 { t_off / t_on } else { 0.0 };
+                println!("probcut-bench depth={depth} from_plies={from_plies} seed={seed}");
+                println!(
+                    "  off: value={v_off} nodes={n_off} time={t_off:.3}s nps={}",
+                    nps(n_off, t_off)
+                );
+                println!(
+                    "  on : value={v_on} nodes={n_on} time={t_on:.3}s nps={}",
+                    nps(n_on, t_on)
+                );
+                println!(
+                    "  probcut_speedup: node_ratio(on/off)={node_ratio:.4} \
+                     node_reduction={:.1}% time_speedup(off/on)={time_speedup:.2}x \
+                     value_delta={}",
+                    (1.0 - node_ratio) * 100.0,
+                    v_on - v_off
+                );
             } else {
-                0
-            };
-            println!(
-                "bench-search depth={} best={} value={} nodes={} time={:.3}s nps={}",
-                result.depth,
-                best,
-                result.value,
-                result.nodes,
-                elapsed.as_secs_f64(),
-                nps
-            );
+                let pc = build_probcut(probcut, no_probcut, probcut_t, probcut_params.as_ref())?;
+                let (value, nodes, secs) = bench_one(&root, depth, pc);
+                let pc_kind = if pc.enabled { "on" } else { "off" };
+                println!(
+                    "bench-search depth={depth} from_plies={from_plies} \
+                     probcut={pc_kind} value={value} nodes={nodes} \
+                     time={secs:.3}s nps={}",
+                    nps(nodes, secs)
+                );
+            }
         }
         Command::Selfplay => {
             println!("selfplay: not yet implemented (Phase 4)");
@@ -319,8 +542,57 @@ fn main() -> Result<()> {
                 output.display()
             );
         }
-        Command::ProbcutFit => {
-            println!("probcut-fit: not yet implemented (Phase 5)");
+        Command::ProbcutFit {
+            single_pair,
+            source,
+            wthor_dir,
+            samples,
+            seed,
+            eval_weights,
+            probcut_t,
+            output,
+        } => {
+            let (d, h) = parse_pair(&single_pair)?;
+            let src = match source.as_str() {
+                "selfplay" => probcut_fit::Source::Selfplay {
+                    games: samples, // one position per game minimum; capped by samples
+                    seed,
+                },
+                "wthor" => {
+                    let dir = wthor_dir.ok_or_else(|| {
+                        anyhow::anyhow!("--wthor-dir is required for --source wthor")
+                    })?;
+                    probcut_fit::Source::Wthor {
+                        dir,
+                        max_games: samples,
+                    }
+                }
+                other => bail!("unknown --source '{other}' (want selfplay|wthor)"),
+            };
+            let res = probcut_fit::run_fit(
+                d,
+                h,
+                &src,
+                samples,
+                eval_weights.as_deref(),
+                probcut_t,
+                &output,
+            )?;
+            let eval_kind = match &eval_weights {
+                Some(p) => format!("pattern({})", p.display()),
+                None => "basic".to_string(),
+            };
+            println!(
+                "probcut-fit single-pair={d}:{h} source={source} samples<={samples} \
+                 seed={seed} eval={eval_kind} T={probcut_t} output={}",
+                output.display()
+            );
+            for (name, ph) in [("phase<36", res.lt36), ("phase>=36", res.ge36)] {
+                println!(
+                    "  {name}: a={:.6} b={:.6} sigma={:.6} R2={:.6} n={}",
+                    ph.a, ph.b, ph.sigma, ph.r2, ph.n
+                );
+            }
         }
         Command::MatchReplay => {
             println!("match-replay: not yet implemented (Phase 9)");

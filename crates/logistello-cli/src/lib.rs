@@ -9,5 +9,10 @@
 //!   learning (design doc §4.4 B3, §4.5 B5; Phase 4b). Owns the B4
 //!   canonicalisation (reuses the exact `logistello-eval` pack tables) and
 //!   emits the documented `PEX1` columnar binary (see `EXTRACT_FORMAT.md`).
+//! - [`probcut_fit`] — single-ProbCut `(a, b, σ)` coefficient estimation
+//!   (design doc §4.3.4 / §4.5 B7; Phase 5). Generates a sample corpus,
+//!   measures `v_d`/`v_h`, fits OLS per disc-count phase, and writes a
+//!   [`logistello_search::ProbCutConfig`]-compatible JSON file.
 
 pub mod extract;
+pub mod probcut_fit;

@@ -25,6 +25,10 @@ name = "search_test"
 path = "../../tests/search_test.rs"
 
 [[test]]
+name = "probcut_test"
+path = "../../tests/probcut_test.rs"
+
+[[test]]
 name = "endgame_test"
 path = "../../tests/endgame_test.rs"
 
@@ -47,6 +51,8 @@ path = "../../tests/eval_interop_test.rs"
 [dependencies]
 clap.workspace = true
 anyhow.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
 logistello-core.workspace = true
 logistello-eval.workspace = true
 logistello-search.workspace = true

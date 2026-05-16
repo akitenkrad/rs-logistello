@@ -31,4 +31,5 @@ pub use engine::{
 };
 pub use iterative::{SearchResult, reference_negamax, search, search_with};
 pub use killer::KillerTable;
+pub use probcut::{PROBCUT_PHASE_SPLIT_DISCS, ProbCutConfig, ProbCutParams, probcut_bounds};
 pub use tt::{Bound, Entry, TranspositionTable};

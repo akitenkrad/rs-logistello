@@ -426,6 +426,8 @@ dependencies = [
  "othello-player",
  "rand",
  "rand_chacha",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

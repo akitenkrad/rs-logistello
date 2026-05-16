@@ -28,6 +28,7 @@ use logistello_eval::LeafEvaluator;
 use othello_core::{GameState, Move};
 
 use crate::killer::KillerTable;
+use crate::probcut::{ProbCutConfig, probcut_bounds};
 use crate::tt::{Bound, Entry, TranspositionTable};
 
 /// Score sentinel used for ±infinity. Far outside the legal score range
@@ -35,13 +36,23 @@ use crate::tt::{Bound, Entry, TranspositionTable};
 pub const INF: i32 = 1_000_000;
 
 /// Tunable search behaviour. Defaults enable every (value-preserving)
-/// ordering heuristic; tests flip individual flags to assert invariance.
+/// ordering heuristic and keep ProbCut **off**, so a default config
+/// reproduces the Phase 2/3 NegaScout exactly (every soundness invariant
+/// holds); tests flip individual flags to assert invariance.
 #[derive(Debug, Clone, Copy)]
 pub struct SearchConfig {
     /// Use the transposition table for cutoffs / move ordering.
     pub use_tt: bool,
     /// Use killer-move ordering.
     pub use_killers: bool,
+    /// Single-ProbCut configuration (design doc §4.3.4 / §4.5 B7).
+    ///
+    /// [`ProbCutConfig::default`] is **disabled**; when disabled the search
+    /// is byte-identical to the Phase 2 NegaScout. ProbCut is an *unsound*
+    /// forward prune (by design): with it enabled the search trades exact
+    /// minimax equality for speed, so the correct invariant becomes
+    /// statistical agreement, never byte equality.
+    pub probcut: ProbCutConfig,
 }
 
 impl Default for SearchConfig {
@@ -49,6 +60,7 @@ impl Default for SearchConfig {
         Self {
             use_tt: true,
             use_killers: true,
+            probcut: ProbCutConfig::default(),
         }
     }
 }
@@ -179,6 +191,59 @@ pub fn negascout<E: LeafEvaluator>(
             }
             if alpha >= beta {
                 return e.value;
+            }
+        }
+    }
+
+    // --- Single ProbCut (design doc §4.3.4 / §4.5 B7) ---------------------
+    //
+    // Attempted at an *interior* node whose remaining height is exactly
+    // `h` (the canonical 8), when ProbCut is enabled and a usable
+    // coefficient cell exists for this node's disc-count phase. By
+    // construction this is reached only **after** the terminal (step 1),
+    // must-pass (step 2) and horizon (step 3) returns, so ProbCut never
+    // fires on a terminal or must-pass node. It also runs after the TT
+    // narrowing, so it composes with the TT (the probes recurse through
+    // the full `negascout`, sharing the same TT/killers). The exact
+    // endgame solver runs with a default `SearchConfig` (ProbCut OFF), so
+    // ProbCut can never bypass the Phase-3 exact endgame search.
+    //
+    // ProbCut is intentionally unsound: the depth-`d` probe predicts the
+    // depth-`h` value only up to the regression's residual σ, so on a
+    // fraction of nodes the returned `beta`/`alpha` differs from the true
+    // minimax value. This is the deliberate speed/accuracy trade-off; the
+    // correct on-invariant is statistical agreement, never equality.
+    {
+        let pc = &ctx.config.probcut;
+        if pc.enabled && depth == pc.h && pc.d < depth {
+            let discs = 64 - state.board.empty_count();
+            let params = *pc.params_for_discs(discs);
+            if params.is_usable() {
+                let (bound_low, bound_high) = probcut_bounds(&params, pc.t, alpha, beta);
+                let probe_depth = pc.d;
+
+                // Probe 1: probable fail-high. Null window just below
+                // `bound_high`. `bound_high - 1` is safe: `probcut_bounds`
+                // clamps to ±INF, so the synthesised window stays in i32.
+                if bound_high < INF {
+                    let v = negascout(ctx, state, bound_high - 1, bound_high, probe_depth, ply + 1);
+                    if v >= bound_high {
+                        // Probable β-cut; do not pollute the TT with this
+                        // unsound bound (keep the table sound for the
+                        // ProbCut-OFF invariants).
+                        return beta;
+                    }
+                }
+
+                // Probe 2: probable fail-low. Null window just above
+                // `bound_low`.
+                if bound_low > -INF {
+                    let v = negascout(ctx, state, bound_low, bound_low + 1, probe_depth, ply + 1);
+                    if v <= bound_low {
+                        return alpha;
+                    }
+                }
+                // Fall through: normal full-depth-`h` NegaScout below.
             }
         }
     }
