@@ -1,0 +1,13 @@
+[package]
+name = "logistello-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Logistello reproduction: alpha-beta / NegaScout search with TT, killers, iterative deepening, and (Multi-)ProbCut."
+
+[dependencies]
+othello-core.workspace = true
+logistello-core.workspace = true
+logistello-eval.workspace = true

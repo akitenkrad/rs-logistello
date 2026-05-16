@@ -1,0 +1,13 @@
+[project]
+name = "logistello-workspace"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "logistello-tools",
+]
+
+[tool.uv.workspace]
+members = ["tools"]
+
+[tool.uv.sources]
+logistello-tools = { workspace = true }

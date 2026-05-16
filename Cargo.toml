@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/logistello-core",
+    "crates/logistello-eval",
+    "crates/logistello-search",
+    "crates/logistello-book",
+    "crates/logistello-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["akitenkrad <yaflam07@gmail.com>"]
+repository = "https://github.com/akitenkrad/replication-logistello"
+
+[workspace.dependencies]
+# --- Reused Othello library: rs-othello-sim (git, pinned) ---
+othello-core = { git = "https://github.com/akitenkrad/rs-othello-sim", rev = "0ba79a91a78e21858c5a67919a98b68f05e5a30f" }
+othello-io = { git = "https://github.com/akitenkrad/rs-othello-sim", rev = "0ba79a91a78e21858c5a67919a98b68f05e5a30f" }
+othello-player = { git = "https://github.com/akitenkrad/rs-othello-sim", rev = "0ba79a91a78e21858c5a67919a98b68f05e5a30f" }
+othello-engine = { git = "https://github.com/akitenkrad/rs-othello-sim", rev = "0ba79a91a78e21858c5a67919a98b68f05e5a30f" }
+
+# --- Internal crates ---
+logistello-core = { path = "crates/logistello-core" }
+logistello-eval = { path = "crates/logistello-eval" }
+logistello-search = { path = "crates/logistello-search" }
+logistello-book = { path = "crates/logistello-book" }
+
+# --- Shared third-party dependencies ---
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+rayon = "1"
+rand = "0.8"
+rand_chacha = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "1"
+csv = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

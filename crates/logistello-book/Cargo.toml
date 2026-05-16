@@ -1,0 +1,13 @@
+[package]
+name = "logistello-book"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Logistello reproduction: opening-book learning and drawishness evaluation (Buro 1999)."
+
+[dependencies]
+othello-core.workspace = true
+logistello-search.workspace = true
+othello-engine.workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "logistello-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Logistello reproduction: unified command-line interface."
+
+[[bin]]
+name = "logistello"
+path = "src/main.rs"
+
+# Workspace-level integration test (lives at the repo root `tests/`).
+[[test]]
+name = "perft_test"
+path = "../../tests/perft_test.rs"
+
+[dependencies]
+clap.workspace = true
+anyhow.workspace = true
+logistello-core.workspace = true
+logistello-eval.workspace = true
+logistello-search.workspace = true
+logistello-book.workspace = true
+othello-io.workspace = true
+othello-player.workspace = true
+othello-engine.workspace = true
+
+[dev-dependencies]
+logistello-core.workspace = true

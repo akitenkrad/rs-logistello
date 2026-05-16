@@ -1,0 +1,9 @@
+/target
+.claude/
+results/*
+!results/.gitkeep
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+**/*.rs.bk

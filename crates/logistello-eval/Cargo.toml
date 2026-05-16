@@ -1,0 +1,12 @@
+[package]
+name = "logistello-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Logistello reproduction: pattern-based evaluation function (inference side)."
+
+[dependencies]
+othello-core.workspace = true
+logistello-core.workspace = true
