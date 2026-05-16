@@ -18,3 +18,8 @@ pub mod killer;
 pub mod multi_probcut;
 pub mod probcut;
 pub mod tt;
+
+pub use alphabeta::{INF, SearchConfig, SearchContext, negascout, terminal_score};
+pub use iterative::{SearchResult, reference_negamax, search, search_with};
+pub use killer::KillerTable;
+pub use tt::{Bound, Entry, TranspositionTable};

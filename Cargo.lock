@@ -388,9 +388,12 @@ dependencies = [
  "logistello-core",
  "logistello-eval",
  "logistello-search",
+ "othello-core",
  "othello-engine",
  "othello-io",
  "othello-player",
+ "rand",
+ "rand_chacha",
 ]
 
 [[package]]
@@ -398,6 +401,8 @@ name = "logistello-core"
 version = "0.1.0"
 dependencies = [
  "othello-core",
+ "rand",
+ "rand_chacha",
 ]
 
 [[package]]

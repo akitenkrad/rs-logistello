@@ -17,4 +17,4 @@ pub mod zobrist;
 
 pub use consts::{BOARD_CELLS, BOARD_SIZE};
 pub use perft::perft;
-pub use zobrist::Zobrist;
+pub use zobrist::{Zobrist, zobrist_key};

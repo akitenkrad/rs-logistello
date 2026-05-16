@@ -11,10 +11,14 @@ description = "Logistello reproduction: unified command-line interface."
 name = "logistello"
 path = "src/main.rs"
 
-# Workspace-level integration test (lives at the repo root `tests/`).
+# Workspace-level integration tests (live at the repo root `tests/`).
 [[test]]
 name = "perft_test"
 path = "../../tests/perft_test.rs"
+
+[[test]]
+name = "search_test"
+path = "../../tests/search_test.rs"
 
 [dependencies]
 clap.workspace = true
@@ -23,9 +27,15 @@ logistello-core.workspace = true
 logistello-eval.workspace = true
 logistello-search.workspace = true
 logistello-book.workspace = true
+othello-core.workspace = true
 othello-io.workspace = true
 othello-player.workspace = true
 othello-engine.workspace = true
 
 [dev-dependencies]
 logistello-core.workspace = true
+logistello-eval.workspace = true
+logistello-search.workspace = true
+othello-core.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
