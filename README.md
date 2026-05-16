@@ -62,21 +62,63 @@ cargo test
 position and should print `8200` (the standard Othello perft value), confirming
 the reused move generator and the local perft are wired correctly end-to-end.
 
+### Phase 4b: evaluation-weight training pipeline
+
+The evaluation function is trained from games end-to-end: Rust extracts
+training positions (it owns the Edax-faithful B4 canonicalisation), Python
+fits the per-stage linear model (design doc §4.4 B3), and Rust loads the
+learned weights for play. The on-disk weight format is `LGW1`, a fully
+explicit little-endian layout that Rust and Python write/read **byte-
+identically** (see `crates/logistello-eval/WEIGHTS_FORMAT.md`); the extract
+format is the columnar `PEX1` (`crates/logistello-eval/EXTRACT_FORMAT.md`).
+
+```bash
+# 1. Extract training positions.
+#    a) self-play (deterministic, no external data — the test vehicle):
+cargo run --release -p logistello-cli -- extract \
+    --source selfplay --games 300 --seed 1 --output /tmp/pos.bin
+#    b) OR real WTHOR expert games (manual download, design doc §4.5 B5):
+#       curl -L -o WTH_2004.ZIP \
+#         https://www.ffothello.org/wthor/base_zip/WTH_2004.ZIP
+#       unzip WTH_2004.ZIP -d data/wthor/
+cargo run --release -p logistello-cli -- extract \
+    --source wthor --wthor-dir data/wthor/ --output /tmp/pos.bin
+
+# 2. Train the per-stage linear eval (faithful B3 GD-300 by default;
+#    --method ridge|sgd for the scikit-learn §7 comparison paths).
+uv run logistello-tools train-eval \
+    --positions /tmp/pos.bin --output /tmp/w.lgw1 --method gd
+
+# 3. Play using the learned pattern evaluator.
+cargo run --release -p logistello-cli -- play \
+    --black engine --white random --depth 4 --seed 42 \
+    --eval-weights /tmp/w.lgw1
+```
+
+Without `--eval-weights`, `play` uses the Phase 3 `BasicEval` (disc count +
+mobility); with it, the engine uses the learned Edax-style `PatternEval`.
+
 ### Python
 
 ```bash
 uv sync
 uv run logistello-tools --help
+uv run logistello-tools train-eval --positions FILE --output FILE.lgw1
 ```
 
-The Python tools (`wthor-extract`, `train-eval`, `train-glem`, `visualize`,
-`visualize-sweep`, `show-experiment-settings`) are scaffolded as stubs and will
-be filled in per implementation phase.
+`train-eval` is implemented (Phase 4b). The remaining Python tools
+(`train-glem`, `visualize`, `visualize-sweep`, `show-experiment-settings`)
+are scaffolded as stubs and will be filled in per implementation phase;
+`wthor-extract` is intentionally delegated to the Rust `extract` subcommand
+(Rust owns the B4 canonicalisation).
 
 ## Status
 
-Project scaffold. Only `perft` is wired end-to-end; every other Rust subcommand
-and Python tool is a Phase-tagged placeholder.
+Phases 0-4b are wired end-to-end: `perft`, full game `play` (basic and
+learned pattern evaluators), Phase 4b position `extract` (self-play / WTHOR)
+and the Python `train-eval` linear-regression pipeline producing
+cross-language byte-identical `LGW1` weights. Other Rust subcommands and
+Python tools remain Phase-tagged placeholders.
 
 ## References
 

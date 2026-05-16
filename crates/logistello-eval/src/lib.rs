@@ -31,4 +31,4 @@ pub use pattern::{
 };
 pub use pattern_eval::PatternEval;
 pub use stage::{N_STAGES, stage, stage_for_state};
-pub use weights::{EVAL_PACKED_SIZE, EvalWeights, PackTable, PackTables, Weights};
+pub use weights::{EVAL_PACKED_SIZE, EvalWeights, PackTable, PackTables, Weights, WeightsError};

@@ -1,35 +1,41 @@
-# `EvalWeights` serialization format (`LGW1`)
+# `EvalWeights` serialization format (`LGW1`, explicit little-endian)
 
 This is the binary contract between the **Phase 4b Python trainer**
 (`logistello_tools train-eval`, which *writes* the file) and the Rust
 inference side (`logistello-eval`, which *reads* it). It is our own format —
-it is **not** Edax's `eval.dat` (see "Future / optional" below).
+**not** Edax's `eval.dat` (see "Future / optional" below).
+
+It is a **fully explicit little-endian byte layout** (no `serde`/`bincode`
+internals), so Rust (`EvalWeights::{to_bytes,from_bytes,load,save}`) and
+Python (`logistello_tools.lgw1`) emit/consume **byte-identical** files. The
+GOLD interop test proves this bit-for-bit.
 
 ## Units & semantics
 
-- Weights are signed integers in **1/128-disc units** (design doc §4.4 B1;
-  Edax `src/midgame.c:36-44`). The leaf score is
-  `round(sum / 128)` with Edax bias rounding, clamped to `±63`.
+- Weights are signed `i32` in **1/128-disc units** (design doc §4.4 B1;
+  Edax `src/midgame.c:36-44`). The leaf score is `round(sum / 128)` with
+  Edax bias rounding, clamped to `±63`.
 - Weights are stored **per canonical class**, not per raw key. Symmetry-
   equivalent raw feature keys share one trainable weight via the Edax
   pack/unpack tables (design doc §4.4 B4, `src/eval.c:498-560`).
 
-## Layout
+## Layout (exact byte offsets, all integers little-endian)
 
-The on-disk bytes are the `bincode` (v1, default config: little-endian,
-fixed-int, no varint) encoding of this struct:
+| offset | type       | value / meaning                                              |
+|--------|------------|--------------------------------------------------------------|
+| 0      | `u32` LE   | `magic` = `0x3157474C` = ASCII `"LGW1"`                       |
+| 4      | `u32` LE   | `version` = `1`                                              |
+| 8      | `u32` LE   | `n_stages` = `13` (design doc §4.4 B2)                        |
+| 12     | `u32` LE   | `n_types` = `9` (8 symmetry classes + the constant term)     |
+| 16     | `[u32;9]`  | `canon_sizes`, LE; must equal `EVAL_PACKED_SIZE` (see below)  |
+| 52     | `u64` LE   | `data_len` = `13 * Σ canon_sizes` = `971815`                 |
+| 60     | `i32[]` LE | `data`: exactly `data_len` little-endian `i32` weights        |
 
-| Field         | Type        | Value / meaning                                              |
-|---------------|-------------|--------------------------------------------------------------|
-| `magic`       | `u32`       | `0x3157474C` = ASCII `"LGW1"` (little-endian)                 |
-| `version`     | `u32`       | `1`                                                          |
-| `n_stages`    | `u32`       | `13` (design doc §4.4 B2)                                     |
-| `n_types`     | `u32`       | `9` (8 pattern symmetry classes + the constant term)         |
-| `canon_sizes` | `[u32; 9]`  | canonical-class count per type; must equal `EVAL_PACKED_SIZE` |
-| `data`        | `Vec<i32>`  | all weights, row-major (see below)                           |
+Total file size = `60 + 4 * 971815` = `3_887_320` bytes.
 
-`bincode` prefixes the `Vec<i32>` with its `u64` element count, then the
-elements as little-endian `i32`.
+`from_bytes` **rejects** a blob with the wrong magic/version, wrong
+stage/type count, canonical sizes that disagree with the vendored Edax
+pack tables, a truncated body, or any trailing bytes.
 
 ### `canon_sizes` / type order
 
@@ -46,8 +52,8 @@ order:
 C9=10206  C10=29889  S10=29646  S8=3321  S7=1134  S6=378  S5=135  S4=45  Const=1
 ```
 
-`from_bytes` rebuilds the pack tables from the vendored Edax arrays and
-**rejects** any blob whose `canon_sizes` disagree.
+The Rust reader rebuilds the pack tables from the vendored Edax arrays and
+rejects any blob whose `canon_sizes` disagree.
 
 ### `data` ordering
 
@@ -75,6 +81,19 @@ reuses `EVAL_S10` / `EVAL_S8` for several feature groups.)
    (`key = key*3 + cellcode`, cellcode `0=side-to-move,1=opp,2=empty`).
 3. `canon = player_pack[type][key]` (design doc §4.4 B4).
 4. `weight = data[stage][type][canon]`; sum over all 47, then round.
+
+## Cross-language contract & GOLD test
+
+The Python writer `logistello_tools.lgw1.write_lgw1` produces this exact
+byte layout (it builds the Edax pack tables identically and emits
+`struct`-packed little-endian fields). The interop GOLD test
+(`tests/eval_interop_test.rs`) loads a Python-written `tests/data/fixture.lgw1`
+into the Rust `PatternEval` and asserts, for the positions in
+`tests/data/fixture_positions.json`, that `PatternEval` returns exactly the
+Python model's own prediction `round(Σ canonical_w / 128)` with Edax bias
+rounding. A second part round-trips a known Rust `EvalWeights` →
+Python (read+rewrite) → Rust and asserts byte-identity. This proves the B4
+canonical mapping + the LGW1 contract are consistent across languages.
 
 ## Future / optional
 

@@ -7,6 +7,10 @@ authors.workspace = true
 repository.workspace = true
 description = "Logistello reproduction: unified command-line interface."
 
+[lib]
+name = "logistello_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "logistello"
 path = "src/main.rs"
@@ -32,6 +36,14 @@ path = "../../tests/engine_play_test.rs"
 name = "pattern_test"
 path = "../../tests/pattern_test.rs"
 
+[[test]]
+name = "extract_test"
+path = "../../tests/extract_test.rs"
+
+[[test]]
+name = "eval_interop_test"
+path = "../../tests/eval_interop_test.rs"
+
 [dependencies]
 clap.workspace = true
 anyhow.workspace = true
@@ -53,3 +65,4 @@ othello-engine.workspace = true
 othello-player.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+serde_json.workspace = true

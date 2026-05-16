@@ -16,7 +16,7 @@
 //! evaluator / config.
 
 use logistello_core::Zobrist;
-use logistello_eval::{BasicEval, LeafEvaluator};
+use logistello_eval::{BasicEval, LeafEvaluator, PatternEval};
 use othello_core::{Color, GameState, Move};
 use othello_player::{Player, PlayerError};
 
@@ -145,6 +145,31 @@ pub fn decide_move<E: LeafEvaluator>(
     decide_move_with_dispatch(root, eval, cfg, tt, killers, zobrist).1
 }
 
+/// Midgame leaf evaluator a [`LogistelloPlayer`] can carry: the Phase 3
+/// [`BasicEval`] (disc + mobility) or the Phase 4 [`PatternEval`]
+/// (Edax-準拠 learned pattern model, design doc §4.3.3 / §4.4 B1-B4).
+///
+/// Both arms satisfy the [`LeafEvaluator`] contract (side-to-move POV,
+/// disc-scale, pure), so the search's minimax invariants hold for either.
+#[derive(Debug, Clone)]
+pub enum EngineEval {
+    /// Phase 3 disc-count + mobility evaluator.
+    Basic(BasicEval),
+    /// Phase 4 learned pattern/regression evaluator (boxed: it owns the
+    /// large `EvalWeights` table — keeps the enum small).
+    Pattern(Box<PatternEval>),
+}
+
+impl LeafEvaluator for EngineEval {
+    #[inline]
+    fn eval(&self, state: &GameState) -> i32 {
+        match self {
+            EngineEval::Basic(e) => e.eval(state),
+            EngineEval::Pattern(e) => e.eval(state),
+        }
+    }
+}
+
 /// Logistello engine as an `othello_player::Player`.
 ///
 /// Owns its transposition table, killer table, Zobrist hasher, evaluator,
@@ -156,7 +181,7 @@ pub struct LogistelloPlayer {
     name: String,
     color: Color,
     config: EngineConfig,
-    eval: BasicEval,
+    eval: EngineEval,
     tt: TranspositionTable,
     killers: KillerTable,
     zobrist: Zobrist,
@@ -171,7 +196,23 @@ impl LogistelloPlayer {
             name: "Logistello".to_string(),
             color,
             config,
-            eval: BasicEval::default(),
+            eval: EngineEval::Basic(BasicEval::default()),
+            tt: TranspositionTable::new(),
+            killers: KillerTable::new(),
+            zobrist: Zobrist::new(),
+        }
+    }
+
+    /// Builds a player for `color` that uses the Phase 4 [`PatternEval`]
+    /// (learned `LGW1` weights) as the midgame leaf evaluator instead of
+    /// [`BasicEval`].
+    #[must_use]
+    pub fn with_pattern(color: Color, config: EngineConfig, pattern: PatternEval) -> Self {
+        Self {
+            name: "Logistello".to_string(),
+            color,
+            config,
+            eval: EngineEval::Pattern(Box::new(pattern)),
             tt: TranspositionTable::new(),
             killers: KillerTable::new(),
             zobrist: Zobrist::new(),

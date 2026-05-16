@@ -478,7 +478,7 @@ fn zeros_eval_is_zero_and_serde_roundtrips() {
             }
         }
     }
-    let bytes = w.to_bytes().expect("serialize");
+    let bytes = w.to_bytes();
     let back = EvalWeights::from_bytes(&bytes).expect("deserialize");
     assert_eq!(w, back);
 }

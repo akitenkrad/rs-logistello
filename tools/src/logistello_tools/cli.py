@@ -15,11 +15,21 @@ import sys
 
 
 def _wthor_extract(argv: list[str]) -> None:
-    print("wthor-extract: not yet implemented (Phase 4)")
+    # Phase 4b: position extraction is owned by the Rust CLI (it owns the
+    # B4 canonicalisation). Use `logistello extract --source wthor
+    # --wthor-dir DIR --output FILE` (selfplay source needs no data); see
+    # crates/logistello-eval/EXTRACT_FORMAT.md.
+    print(
+        "wthor-extract: extraction is performed by the Rust CLI "
+        "(`cargo run -p logistello-cli -- extract --source wthor "
+        "--wthor-dir DIR --output FILE`); see EXTRACT_FORMAT.md"
+    )
 
 
 def _train_eval(argv: list[str]) -> None:
-    print("train-eval: not yet implemented (Phase 4)")
+    from logistello_tools.train_eval import main as run_main
+
+    run_main(argv)
 
 
 def _train_glem(argv: list[str]) -> None:

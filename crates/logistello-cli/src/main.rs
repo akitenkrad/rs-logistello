@@ -4,13 +4,16 @@
 //! Phase-tagged placeholder that prints a "not yet implemented" message and
 //! returns success.
 
+use logistello_cli::extract;
+
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 use logistello_core::perft::perft_standard;
-use logistello_eval::DiscDiffEval;
+use logistello_eval::{DiscDiffEval, EvalWeights};
 use logistello_search::iterative::search;
 use logistello_search::{EngineConfig, LogistelloPlayer};
 use othello_core::{Color, GameState, Move};
@@ -54,6 +57,11 @@ enum Command {
         /// Seed for the random opponent (engine play is deterministic).
         #[arg(long, default_value_t = 42)]
         seed: u64,
+        /// Optional `LGW1` learned-weight file. When given, the `engine`
+        /// player uses the Phase 4 `PatternEval` loaded from it instead of
+        /// the Phase 3 `BasicEval` (design doc §4.3.3 / §4.4 B1-B4).
+        #[arg(long)]
+        eval_weights: Option<PathBuf>,
     },
     /// Benchmark the Phase 2 search from the standard opening using the
     /// trivial disc-difference evaluator (one working end-to-end path).
@@ -64,6 +72,31 @@ enum Command {
     },
     /// Run self-play games for data generation (Phase 4).
     Selfplay,
+    /// Extract training positions for evaluation-weight learning
+    /// (Phase 4b; design doc §4.4 B3, §4.5 B5). Emits the `PEX1` columnar
+    /// binary the Python `train-eval` tool consumes (see EXTRACT_FORMAT.md).
+    Extract {
+        /// Corpus: `selfplay` (RandomPlayer self-play, seeded, no external
+        /// data) or `wthor` (real `.wtb` expert games).
+        #[arg(long, default_value = "selfplay")]
+        source: String,
+        /// Directory containing `.wtb` files (required for `--source wthor`).
+        #[arg(long)]
+        wthor_dir: Option<PathBuf>,
+        /// Number of self-play games (`--source selfplay`) / max WTHOR games.
+        #[arg(long, default_value_t = 2000)]
+        games: usize,
+        /// Self-play RNG seed (deterministic).
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Skip positions with more than this many empty squares (drop the
+        /// very opening). Omit to keep every non-terminal position.
+        #[arg(long)]
+        max_empties_skip: Option<u32>,
+        /// Output `PEX1` file.
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Fit ProbCut (a, b, sigma) parameters (Phase 5).
     ProbcutFit,
     /// Replay a recorded match (e.g. Murakami 1997) (Phase 9).
@@ -143,13 +176,24 @@ impl Player for CliPlayer {
 
 /// Builds a [`CliPlayer`] of the requested kind for `color`.
 ///
-/// `engine` -> [`LogistelloPlayer`] with `cfg`; `random` -> seeded
-/// [`RandomPlayer`]; `greedy` -> [`GreedyPlayer`].
-fn make_player(kind: &str, color: Color, cfg: EngineConfig, seed: u64) -> Result<CliPlayer> {
+/// `engine` -> [`LogistelloPlayer`] with `cfg` (using the learned
+/// `PatternEval` when `learned` is supplied, else `BasicEval`);
+/// `random` -> seeded [`RandomPlayer`]; `greedy` -> [`GreedyPlayer`].
+fn make_player(
+    kind: &str,
+    color: Color,
+    cfg: EngineConfig,
+    seed: u64,
+    learned: Option<&logistello_eval::PatternEval>,
+) -> Result<CliPlayer> {
     match kind {
-        "engine" => Ok(CliPlayer::Engine(Box::new(LogistelloPlayer::new(
-            color, cfg,
-        )))),
+        "engine" => {
+            let p = match learned {
+                Some(pe) => LogistelloPlayer::with_pattern(color, cfg, pe.clone()),
+                None => LogistelloPlayer::new(color, cfg),
+            };
+            Ok(CliPlayer::Engine(Box::new(p)))
+        }
         "random" => Ok(CliPlayer::Random(Box::new(RandomPlayer::with_seed(
             color, seed,
         )))),
@@ -168,14 +212,23 @@ fn main() -> Result<()> {
             depth,
             endgame_empties,
             seed,
+            eval_weights,
         } => {
             let cfg = EngineConfig {
                 max_depth: depth,
                 endgame_empties,
                 ..EngineConfig::default()
             };
-            let mut black_player = make_player(&black, Color::Black, cfg, seed)?;
-            let mut white_player = make_player(&white, Color::White, cfg, seed)?;
+            let learned = match &eval_weights {
+                Some(path) => {
+                    let w = EvalWeights::load(path)
+                        .map_err(|e| anyhow::anyhow!("load {}: {e}", path.display()))?;
+                    Some(logistello_eval::PatternEval::new(w))
+                }
+                None => None,
+            };
+            let mut black_player = make_player(&black, Color::Black, cfg, seed, learned.as_ref())?;
+            let mut white_player = make_player(&white, Color::White, cfg, seed, learned.as_ref())?;
 
             let mut engine = GameEngine::new(GameEngineConfig::standard())?;
             let result = engine
@@ -194,9 +247,13 @@ fn main() -> Result<()> {
                 Some(Color::White) => "white",
                 None => "draw",
             };
+            let eval_kind = match &eval_weights {
+                Some(p) => format!("pattern({})", p.display()),
+                None => "basic".to_string(),
+            };
             println!(
                 "play black={black} white={white} depth={depth} \
-                 endgame_empties={endgame_empties} seed={seed}"
+                 endgame_empties={endgame_empties} seed={seed} eval={eval_kind}"
             );
             println!("moves: {}", moves.join(" "));
             println!(
@@ -235,6 +292,32 @@ fn main() -> Result<()> {
         }
         Command::Selfplay => {
             println!("selfplay: not yet implemented (Phase 4)");
+        }
+        Command::Extract {
+            source,
+            wthor_dir,
+            games,
+            seed,
+            max_empties_skip,
+            output,
+        } => {
+            let records = match source.as_str() {
+                "selfplay" => extract::extract_selfplay(games, seed, max_empties_skip)?,
+                "wthor" => {
+                    let dir = wthor_dir.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("--wthor-dir is required for --source wthor")
+                    })?;
+                    extract::extract_wthor(dir, Some(games), max_empties_skip)?
+                }
+                other => bail!("unknown --source '{other}' (want selfplay|wthor)"),
+            };
+            extract::write_pex1(&output, &records)?;
+            println!(
+                "extract source={source} games<={games} \
+                 records={} output={}",
+                records.len(),
+                output.display()
+            );
         }
         Command::ProbcutFit => {
             println!("probcut-fit: not yet implemented (Phase 5)");

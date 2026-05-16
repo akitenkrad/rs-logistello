@@ -26,8 +26,8 @@ pub mod tt;
 pub use alphabeta::{INF, SearchConfig, SearchContext, negascout, terminal_score};
 pub use endgame::{best_endgame_move, solve_exact, solve_wld};
 pub use engine::{
-    DEFAULT_ENDGAME_EMPTIES, DEFAULT_MAX_DEPTH, Dispatch, EngineConfig, LogistelloPlayer,
-    decide_move, decide_move_with_dispatch,
+    DEFAULT_ENDGAME_EMPTIES, DEFAULT_MAX_DEPTH, Dispatch, EngineConfig, EngineEval,
+    LogistelloPlayer, decide_move, decide_move_with_dispatch,
 };
 pub use iterative::{SearchResult, reference_negamax, search, search_with};
 pub use killer::KillerTable;

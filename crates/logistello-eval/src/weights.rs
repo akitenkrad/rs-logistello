@@ -28,15 +28,18 @@
 //! (`eval.c:443`): `{10206, 29889, 29646, 29646, 3321, 3321, 3321, 3321,
 //! 1134, 378, 135, 45, 1}` in accumulate order.
 //!
-//! # `EvalWeights` serialization contract
+//! # `EvalWeights` serialization contract (`LGW1`, explicit little-endian)
 //!
 //! See [`EvalWeights`] and `WEIGHTS_FORMAT.md`. This is the binary contract
-//! the Phase 4b Python trainer writes and this crate reads. Weights are in
+//! the Phase 4b Python trainer writes and this crate reads. It is a fully
+//! explicit little-endian byte layout (no `serde`/`bincode` internals) so
+//! Rust and Python emit/consume **byte-identical** files. Weights are in
 //! **1/128-disc units** (design doc B1; Edax `midgame.c:36-44`).
 
 use crate::pattern::PatternType;
 use crate::stage::N_STAGES;
-use serde::{Deserialize, Serialize};
+use std::io;
+use std::path::Path;
 
 /// `3^k` lookup for `k = 0..=10`.
 const POW3: [u32; 11] = [1, 3, 9, 27, 81, 243, 729, 2187, 6561, 19683, 59049];
@@ -241,22 +244,24 @@ pub const WEIGHTS_MAGIC: u32 = 0x3157_474C; // little-endian "LGW1"
 /// player table) share one trainable weight, exactly as Edax (design doc
 /// B4). Weights are in **1/128-disc units** (design doc B1).
 ///
-/// # Serialization contract (`bincode`, see `WEIGHTS_FORMAT.md`)
+/// # Serialization contract (explicit LE, see `WEIGHTS_FORMAT.md`)
 ///
-/// The on-disk layout is the bincode encoding of [`EvalWeightsBlob`]:
+/// The on-disk layout is a fixed little-endian byte stream (no `serde` /
+/// `bincode`), so Rust and Python produce byte-identical files:
 ///
-/// 1. `magic: u32` = [`WEIGHTS_MAGIC`] (`LGW1`, little-endian).
-/// 2. `version: u32` = `1`.
-/// 3. `n_stages: u32` = `13`.
-/// 4. `n_types: u32` = `9`.
-/// 5. `canon_sizes: [u32; 9]` — canonical count per type, must equal
-///    `EVAL_PACKED_SIZE` (C9,C10,S10,S8,S7,S6,S5,S4,Const).
-/// 6. `data: Vec<i32>` — all weights, row-major as
-///    `stage (0..13) → type (0..9) → canonical_index (0..canon_sizes[type])`,
-///    i.e. `data[((stage*9)+type_slot)`-th block]. Length is
-///    `13 * Σ canon_sizes = 13 * (10206+29889+29646*2+3321*4+1134+378+135+45+1)`.
+/// | offset | type      | meaning                                          |
+/// |--------|-----------|--------------------------------------------------|
+/// | 0      | `u32` LE  | magic = [`WEIGHTS_MAGIC`] (ASCII `LGW1`)          |
+/// | 4      | `u32` LE  | version = `1`                                    |
+/// | 8      | `u32` LE  | n_stages = `13`                                  |
+/// | 12     | `u32` LE  | n_types = `9`                                    |
+/// | 16     | `[u32;9]` | canon_sizes (C9,C10,S10,S8,S7,S6,S5,S4,Const) LE |
+/// | 52     | `u64` LE  | data_len = `13 * Σ canon_sizes` = `971815`       |
+/// | 60     | `i32[]`   | data, `data_len` LE `i32` weights                |
 ///
-/// All integers little-endian (bincode default). The Python trainer writes
+/// `data` is row-major over `stage (0..13)` then `type (0..9)`
+/// (`WEIGHT_TYPE_ORDER`) then `canonical_index (0..canon_sizes[type])`.
+/// Total file size = `60 + 4 * 971815` bytes. The Python trainer writes
 /// this exact structure; loading Edax's own binary `eval.dat` is **not**
 /// implemented (its packed layout differs — see `WEIGHTS_FORMAT.md`
 /// "Future / optional").
@@ -278,15 +283,38 @@ impl PartialEq for EvalWeights {
 
 impl Eq for EvalWeights {}
 
-/// Serializable wire form of [`EvalWeights`] (see [`EvalWeights`] doc).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct EvalWeightsBlob {
-    magic: u32,
-    version: u32,
-    n_stages: u32,
-    n_types: u32,
-    canon_sizes: [u32; 9],
-    data: Vec<i32>,
+/// Fixed-size header of the explicit `LGW1` layout (everything before the
+/// variable-length `data` array): magic, version, n_stages, n_types,
+/// `[u32; 9]` canon_sizes, then a `u64` data length.
+const LGW1_HEADER_BYTES: usize = 4 + 4 + 4 + 4 + 9 * 4 + 8;
+
+/// Error decoding a [`EvalWeights`] `LGW1` blob (bad structure or I/O).
+#[derive(Debug)]
+pub enum WeightsError {
+    /// The byte stream is structurally invalid (bad magic/version, wrong
+    /// stage/type count, canonical-size mismatch, truncated, or trailing
+    /// bytes).
+    Format(String),
+    /// Underlying I/O error from [`EvalWeights::load`] /
+    /// [`EvalWeights::save`].
+    Io(io::Error),
+}
+
+impl std::fmt::Display for WeightsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WeightsError::Format(m) => write!(f, "LGW1 format error: {m}"),
+            WeightsError::Io(e) => write!(f, "LGW1 I/O error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for WeightsError {}
+
+impl From<io::Error> for WeightsError {
+    fn from(e: io::Error) -> Self {
+        WeightsError::Io(e)
+    }
 }
 
 impl EvalWeights {
@@ -344,78 +372,120 @@ impl EvalWeights {
         self.w.iter().flat_map(|s| s.iter()).map(|v| v.len()).sum()
     }
 
-    /// Serializes to the `LGW1` bincode blob (see [`EvalWeights`] doc /
-    /// `WEIGHTS_FORMAT.md`).
-    ///
-    /// # Errors
-    ///
-    /// Returns the underlying `bincode` error if encoding fails.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
+    /// Serializes to the explicit little-endian `LGW1` blob (see
+    /// [`EvalWeights`] doc / `WEIGHTS_FORMAT.md`). This is the byte-for-byte
+    /// contract the Python trainer reproduces.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
         let mut canon_sizes = [0u32; 9];
-        let mut data = Vec::with_capacity(self.total_weights());
-        for (stage_row, _) in self.w.iter().zip(0..N_STAGES) {
-            for (t, vec) in stage_row.iter().enumerate() {
-                canon_sizes[t] = vec.len() as u32;
-                data.extend_from_slice(vec);
+        for (t, vec) in self.w[0].iter().enumerate() {
+            canon_sizes[t] = vec.len() as u32;
+        }
+        let data_len = self.total_weights() as u64;
+        let mut out = Vec::with_capacity(LGW1_HEADER_BYTES + 4 * data_len as usize);
+        out.extend_from_slice(&WEIGHTS_MAGIC.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes()); // version
+        out.extend_from_slice(&(N_STAGES as u32).to_le_bytes());
+        out.extend_from_slice(&9u32.to_le_bytes()); // n_types
+        for &sz in &canon_sizes {
+            out.extend_from_slice(&sz.to_le_bytes());
+        }
+        out.extend_from_slice(&data_len.to_le_bytes());
+        // Row-major: stage -> type -> canonical index.
+        for stage_row in &self.w {
+            for vec in stage_row {
+                for &x in vec {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
             }
         }
-        let blob = EvalWeightsBlob {
-            magic: WEIGHTS_MAGIC,
-            version: 1,
-            n_stages: N_STAGES as u32,
-            n_types: 9,
-            canon_sizes,
-            data,
-        };
-        bincode::serialize(&blob)
+        out
     }
 
-    /// Deserializes a `LGW1` bincode blob and validates the canonical sizes
-    /// against the vendored pack tables (`EVAL_PACKED_SIZE`).
+    /// Deserializes an explicit little-endian `LGW1` blob and validates the
+    /// canonical sizes against the vendored pack tables
+    /// (`EVAL_PACKED_SIZE`).
     ///
     /// # Errors
     ///
-    /// Returns a `bincode` error on decode failure or on a structural
-    /// mismatch (bad magic/version, wrong stage/type count, or canonical
-    /// sizes that disagree with the vendored Edax pack tables).
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
-        let blob: EvalWeightsBlob = bincode::deserialize(bytes)?;
-        let err =
-            |m: &str| -> bincode::Error { Box::new(bincode::ErrorKind::Custom(m.to_string())) };
-        if blob.magic != WEIGHTS_MAGIC {
+    /// Returns [`WeightsError::Format`] on a structural mismatch (bad
+    /// magic/version, wrong stage/type count, canonical sizes that disagree
+    /// with the vendored Edax pack tables, truncation, or trailing bytes).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, WeightsError> {
+        let err = |m: &str| WeightsError::Format(m.to_string());
+        if bytes.len() < LGW1_HEADER_BYTES {
+            return Err(err("truncated header"));
+        }
+        let rd_u32 = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+        if rd_u32(0) != WEIGHTS_MAGIC {
             return Err(err("bad magic (expected LGW1)"));
         }
-        if blob.version != 1 {
+        if rd_u32(4) != 1 {
             return Err(err("unsupported weights version"));
         }
-        if blob.n_stages as usize != N_STAGES || blob.n_types != 9 {
+        if rd_u32(8) as usize != N_STAGES || rd_u32(12) != 9 {
             return Err(err("stage/type count mismatch"));
+        }
+        let mut canon_sizes = [0u32; 9];
+        for (t, slot) in canon_sizes.iter_mut().enumerate() {
+            *slot = rd_u32(16 + 4 * t);
         }
         let tables = PackTables::build();
         for (t, &ty) in WEIGHT_TYPE_ORDER.iter().enumerate() {
-            if blob.canon_sizes[t] != tables.n_canonical(ty) {
+            if canon_sizes[t] != tables.n_canonical(ty) {
                 return Err(err("canonical size mismatch vs vendored pack tables"));
             }
         }
-        let expected: usize = (0..N_STAGES)
-            .flat_map(|_| WEIGHT_TYPE_ORDER.iter())
-            .map(|&ty| tables.n_canonical(ty) as usize)
-            .sum();
-        if blob.data.len() != expected {
+        let data_len = u64::from_le_bytes(bytes[52..60].try_into().unwrap()) as usize;
+        let expected: usize = N_STAGES
+            * WEIGHT_TYPE_ORDER
+                .iter()
+                .map(|&ty| tables.n_canonical(ty) as usize)
+                .sum::<usize>();
+        if data_len != expected {
             return Err(err("weight data length mismatch"));
+        }
+        let want_bytes = LGW1_HEADER_BYTES + 4 * data_len;
+        if bytes.len() != want_bytes {
+            return Err(err("blob size does not match declared data length"));
         }
         let mut w: [[Vec<i32>; 9]; N_STAGES] =
             std::array::from_fn(|_| std::array::from_fn(|_| Vec::new()));
-        let mut off = 0usize;
-        for (stage, stage_row) in w.iter_mut().enumerate() {
-            let _ = stage;
+        let mut off = LGW1_HEADER_BYTES;
+        for stage_row in &mut w {
             for (t, vec) in stage_row.iter_mut().enumerate() {
-                let n = blob.canon_sizes[t] as usize;
-                *vec = blob.data[off..off + n].to_vec();
-                off += n;
+                let n = canon_sizes[t] as usize;
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    v.push(i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()));
+                    off += 4;
+                }
+                *vec = v;
             }
         }
         Ok(Self { w, tables })
+    }
+
+    /// Loads an `LGW1` weights file from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WeightsError::Io`] if the file cannot be read, or
+    /// [`WeightsError::Format`] if its contents are not a valid `LGW1`
+    /// blob (see [`from_bytes`](Self::from_bytes)).
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, WeightsError> {
+        let bytes = std::fs::read(path)?;
+        Self::from_bytes(&bytes)
+    }
+
+    /// Writes this weight set to `path` as an `LGW1` file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WeightsError::Io`] if the file cannot be written.
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), WeightsError> {
+        std::fs::write(path, self.to_bytes())?;
+        Ok(())
     }
 }
 
@@ -539,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn serde_roundtrip_bit_exact() {
+    fn explicit_le_roundtrip_bit_exact() {
         let mut w = EvalWeights::zeros();
         // Poke deterministic non-trivial values across stages/types.
         for s in 0..N_STAGES {
@@ -550,7 +620,18 @@ mod tests {
                 }
             }
         }
-        let bytes = w.to_bytes().expect("serialize");
+        let bytes = w.to_bytes();
+        // Explicit LE layout: fixed header size + 4 * data_len bytes.
+        assert_eq!(bytes.len(), LGW1_HEADER_BYTES + 4 * w.total_weights());
+        // Header is hand-checkable little-endian.
+        assert_eq!(&bytes[0..4], &WEIGHTS_MAGIC.to_le_bytes());
+        assert_eq!(&bytes[4..8], &1u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &(N_STAGES as u32).to_le_bytes());
+        assert_eq!(&bytes[12..16], &9u32.to_le_bytes());
+        assert_eq!(
+            u64::from_le_bytes(bytes[52..60].try_into().unwrap()) as usize,
+            w.total_weights()
+        );
         let back = EvalWeights::from_bytes(&bytes).expect("deserialize");
         assert_eq!(w, back, "EvalWeights round-trip must be bit-exact");
         // Const type has exactly one canonical slot.
@@ -562,9 +643,32 @@ mod tests {
 
     #[test]
     fn from_bytes_rejects_bad_magic() {
-        let mut bytes = EvalWeights::zeros().to_bytes().unwrap();
+        let mut bytes = EvalWeights::zeros().to_bytes();
         bytes[0] ^= 0xFF;
         assert!(EvalWeights::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn from_bytes_rejects_truncation_and_trailing() {
+        let bytes = EvalWeights::zeros().to_bytes();
+        assert!(EvalWeights::from_bytes(&bytes[..bytes.len() - 4]).is_err());
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(EvalWeights::from_bytes(&longer).is_err());
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let mut w = EvalWeights::zeros();
+        for s in 0..N_STAGES {
+            w.weights_mut(s, PatternType::S4)[0] = (s as i32) - 6;
+        }
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("lgw1_test_{}.lgw1", std::process::id()));
+        w.save(&path).expect("save");
+        let back = EvalWeights::load(&path).expect("load");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(w, back);
     }
 
     #[test]
