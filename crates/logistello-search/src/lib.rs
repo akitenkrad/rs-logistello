@@ -9,10 +9,14 @@
 //! - [`tt`]             — Zobrist-keyed transposition table.
 //! - [`killer`]         — killer-move heuristic.
 //! - [`iterative`]      — iterative deepening driver.
+//! - [`endgame`]        — exact endgame solver (design doc §4.5 B8).
+//! - [`engine`]         — three-phase decision driver + engine player.
 //! - [`probcut`]        — single ProbCut (Buro 1995 ICCA).
 //! - [`multi_probcut`]  — Multi-ProbCut cascade (Buro 1997).
 
 pub mod alphabeta;
+pub mod endgame;
+pub mod engine;
 pub mod iterative;
 pub mod killer;
 pub mod multi_probcut;
@@ -20,6 +24,11 @@ pub mod probcut;
 pub mod tt;
 
 pub use alphabeta::{INF, SearchConfig, SearchContext, negascout, terminal_score};
+pub use endgame::{best_endgame_move, solve_exact, solve_wld};
+pub use engine::{
+    DEFAULT_ENDGAME_EMPTIES, DEFAULT_MAX_DEPTH, Dispatch, EngineConfig, LogistelloPlayer,
+    decide_move, decide_move_with_dispatch,
+};
 pub use iterative::{SearchResult, reference_negamax, search, search_with};
 pub use killer::KillerTable;
 pub use tt::{Bound, Entry, TranspositionTable};

@@ -20,6 +20,14 @@ path = "../../tests/perft_test.rs"
 name = "search_test"
 path = "../../tests/search_test.rs"
 
+[[test]]
+name = "endgame_test"
+path = "../../tests/endgame_test.rs"
+
+[[test]]
+name = "engine_play_test"
+path = "../../tests/engine_play_test.rs"
+
 [dependencies]
 clap.workspace = true
 anyhow.workspace = true
@@ -37,5 +45,7 @@ logistello-core.workspace = true
 logistello-eval.workspace = true
 logistello-search.workspace = true
 othello-core.workspace = true
+othello-engine.workspace = true
+othello-player.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true

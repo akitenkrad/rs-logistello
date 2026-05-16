@@ -420,6 +420,9 @@ dependencies = [
  "logistello-core",
  "logistello-eval",
  "othello-core",
+ "othello-player",
+ "rand",
+ "rand_chacha",
 ]
 
 [[package]]
