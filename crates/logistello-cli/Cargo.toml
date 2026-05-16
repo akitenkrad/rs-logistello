@@ -28,6 +28,10 @@ path = "../../tests/endgame_test.rs"
 name = "engine_play_test"
 path = "../../tests/engine_play_test.rs"
 
+[[test]]
+name = "pattern_test"
+path = "../../tests/pattern_test.rs"
+
 [dependencies]
 clap.workspace = true
 anyhow.workspace = true
