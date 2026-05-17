@@ -329,6 +329,232 @@ pub fn run_fit(
     Ok(result)
 }
 
+// ===========================================================================
+// Multi-ProbCut cascade fit (Phase 6; design doc §4.3.5 / §4.5 B7).
+// ===========================================================================
+
+use logistello_search::{DiscPhase, MPC_CASCADE, MpcStageParams, MultiProbCutConfig};
+
+/// One fitted MPC cascade cell: `(disc-phase, h, d)` with its OLS line,
+/// residual σ, R² and sample count.
+#[derive(Debug, Clone, Copy)]
+pub struct MpcCellFit {
+    /// Disc-count phase (`Lt36` / `Ge36`, design doc §4.5 B7 split at 36).
+    pub phase: DiscPhase,
+    /// Search height `h`.
+    pub h: u32,
+    /// Shallow check depth `d`.
+    pub d: u32,
+    /// The OLS fit (`a, b, σ, R², n`).
+    pub fit: PhaseFit,
+}
+
+/// Result of an `--mpc-cascade` fit: every `(phase, h, d)` cell, plus the
+/// emitted [`MultiProbCutConfig`].
+#[derive(Debug, Clone)]
+pub struct McpFitResult {
+    /// Per-cell fits, ordered `(h, d)` ascending then `Lt36` before `Ge36`.
+    pub cells: Vec<MpcCellFit>,
+}
+
+/// Parses an `--mpc-cascade` spec `"h:d1[:d2],..."` into `(h, d1, d2?)`
+/// triples. Validates `0 < d1 (< d2) < h` and rejects malformed entries.
+///
+/// # Errors
+///
+/// Returns an error on any malformed `h:d1[:d2]` group.
+pub fn parse_mpc_cascade(spec: &str) -> Result<Vec<(u32, u32, Option<u32>)>> {
+    let mut out = Vec::new();
+    for raw in spec.split(',') {
+        let g = raw.trim();
+        if g.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = g.split(':').collect();
+        if parts.len() < 2 || parts.len() > 3 {
+            bail!("bad --mpc-cascade group '{g}' (want h:d1[:d2])");
+        }
+        let h: u32 = parts[0]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad height in '{g}'"))?;
+        let d1: u32 = parts[1]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad d1 in '{g}'"))?;
+        let d2: Option<u32> = match parts.get(2) {
+            Some(s) => Some(
+                s.trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("bad d2 in '{g}'"))?,
+            ),
+            None => None,
+        };
+        if d1 == 0 || d1 >= h {
+            bail!("--mpc-cascade '{g}' needs 0 < d1 < h");
+        }
+        if let Some(d2) = d2
+            && (d2 <= d1 || d2 >= h)
+        {
+            bail!("--mpc-cascade '{g}' needs d1 < d2 < h");
+        }
+        out.push((h, d1, d2));
+    }
+    if out.is_empty() {
+        bail!("--mpc-cascade is empty");
+    }
+    Ok(out)
+}
+
+/// Fits every `(phase, h, d)` cascade cell with `eval`.
+///
+/// For each sampled non-terminal position it computes the deep value `v_h`
+/// once per distinct `h` and the shallow value `v_d` once per distinct `d`
+/// (all under the production TT discipline, ProbCut/MPC OFF — exactly the
+/// true depth-`x` values), stratifies the `(v_d, v_h)` pair into the
+/// position's disc-count phase, and runs an independent OLS per
+/// `(phase, h, d)` group (design doc §4.5 B7: "per (disc-phase, h, d)
+/// linear regression").
+/// `(phase_idx, h, d)` → the accumulated `(v_d, v_h)` regression samples.
+type CellSamples = std::collections::BTreeMap<(u8, u32, u32), (Vec<f64>, Vec<f64>)>;
+
+fn fit_mpc_with<E: LeafEvaluator>(
+    positions: &[GameState],
+    cascade: &[(u32, u32, Option<u32>)],
+    eval: &E,
+) -> McpFitResult {
+    use std::collections::BTreeMap;
+    // (phase_idx, h, d) -> (xs, ys).
+    let mut groups: CellSamples = BTreeMap::new();
+
+    for s in positions {
+        if s.is_terminal() {
+            continue;
+        }
+        let discs = 64 - s.board.empty_count();
+        let phase = DiscPhase::for_discs(discs);
+        let pidx = match phase {
+            DiscPhase::Lt36 => 0u8,
+            DiscPhase::Ge36 => 1u8,
+        };
+        // Distinct depths needed for this position's cascade.
+        let mut depths: Vec<u32> = Vec::new();
+        for &(h, d1, d2) in cascade {
+            for x in [Some(h), Some(d1), d2].into_iter().flatten() {
+                if !depths.contains(&x) {
+                    depths.push(x);
+                }
+            }
+        }
+        // Memoise v_x per distinct depth (so a height shared by several
+        // cascade rows is searched once).
+        let mut vx: BTreeMap<u32, f64> = BTreeMap::new();
+        for &x in &depths {
+            vx.insert(x, f64::from(search_value(s, x, eval)));
+        }
+        for &(h, d1, d2) in cascade {
+            let vh = vx[&h];
+            for d in std::iter::once(d1).chain(d2) {
+                let vd = vx[&d];
+                let e = groups.entry((pidx, h, d)).or_default();
+                e.0.push(vd);
+                e.1.push(vh);
+            }
+        }
+    }
+
+    let mut cells = Vec::new();
+    for ((pidx, h, d), (xs, ys)) in groups {
+        let phase = if pidx == 0 {
+            DiscPhase::Lt36
+        } else {
+            DiscPhase::Ge36
+        };
+        cells.push(MpcCellFit {
+            phase,
+            h,
+            d,
+            fit: ols(&xs, &ys),
+        });
+    }
+    // Stable, readable ordering: by (h, d) then phase.
+    cells.sort_by_key(|c| {
+        (
+            c.h,
+            c.d,
+            match c.phase {
+                DiscPhase::Lt36 => 0u8,
+                DiscPhase::Ge36 => 1u8,
+            },
+        )
+    });
+    McpFitResult { cells }
+}
+
+impl McpFitResult {
+    /// Builds a [`MultiProbCutConfig`] (`enabled = true`, canonical 2-phase
+    /// production thresholds 1.0 / 1.4) from this fit.
+    #[must_use]
+    pub fn to_config(&self) -> MultiProbCutConfig {
+        let mut cfg = MultiProbCutConfig::default();
+        cfg.enabled = true;
+        for c in &self.cells {
+            cfg.set_params(
+                c.phase,
+                c.h,
+                c.d,
+                MpcStageParams::new(c.fit.a, c.fit.b, c.fit.sigma),
+            );
+        }
+        cfg
+    }
+}
+
+/// Public entry point for `probcut-fit --mpc-cascade`: collect the corpus,
+/// fit every `(phase, h, d)` cascade cell with the chosen evaluator, write
+/// the [`MultiProbCutConfig`] JSON, and return the per-cell fits for
+/// printing.
+///
+/// # Errors
+///
+/// Propagates corpus / I/O errors.
+pub fn run_mpc_fit(
+    cascade: &[(u32, u32, Option<u32>)],
+    src: &Source,
+    samples: usize,
+    eval_weights: Option<&Path>,
+    output: &Path,
+) -> Result<McpFitResult> {
+    let positions = collect_positions(src, samples)?;
+    if positions.is_empty() {
+        bail!("no positions collected from the corpus");
+    }
+    let result = match eval_weights {
+        Some(p) => {
+            let w =
+                EvalWeights::load(p).map_err(|e| anyhow::anyhow!("load {}: {e}", p.display()))?;
+            fit_mpc_with(&positions, cascade, &PatternEval::new(w))
+        }
+        None => fit_mpc_with(&positions, cascade, &BasicEval::default()),
+    };
+    result.to_config().save_json(output)?;
+    Ok(result)
+}
+
+/// The canonical B7 cascade as an `--mpc-cascade` spec string (design doc
+/// §4.5 B7), used as the CLI default and in tests.
+#[must_use]
+pub fn canonical_mpc_cascade_spec() -> String {
+    MPC_CASCADE
+        .iter()
+        .map(|&(h, d1, d2)| match d2 {
+            Some(d2) => format!("{h}:{d1}:{d2}"),
+            None => format!("{h}:{d1}"),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,5 +636,177 @@ mod tests {
         assert_eq!(back.h, 8);
         assert!(back.params_lt36.is_usable());
         assert!(back.params_ge36.is_usable());
+    }
+
+    // ---- Multi-ProbCut cascade fit (Phase 6) ------------------------------
+
+    #[test]
+    fn parse_mpc_cascade_canonical_b7() {
+        let spec = "3:1,4:2,5:1,6:2,7:3,8:4,9:3:5,10:4:6,11:3:5,12:4,13:5";
+        let c = parse_mpc_cascade(spec).unwrap();
+        assert_eq!(c.len(), 11);
+        assert_eq!(c[0], (3, 1, None));
+        assert_eq!(c[6], (9, 3, Some(5)));
+        assert_eq!(c[7], (10, 4, Some(6)));
+        assert_eq!(c[10], (13, 5, None));
+        // Round-trips through the canonical spec helper.
+        assert_eq!(parse_mpc_cascade(&canonical_mpc_cascade_spec()).unwrap(), c);
+    }
+
+    #[test]
+    fn parse_mpc_cascade_rejects_malformed() {
+        assert!(parse_mpc_cascade("").is_err(), "empty");
+        assert!(parse_mpc_cascade("8").is_err(), "no d");
+        assert!(parse_mpc_cascade("8:4:5:6").is_err(), "too many parts");
+        assert!(parse_mpc_cascade("8:8").is_err(), "d1 >= h");
+        assert!(parse_mpc_cascade("8:0").is_err(), "d1 == 0");
+        assert!(parse_mpc_cascade("9:5:3").is_err(), "d2 <= d1");
+        assert!(parse_mpc_cascade("9:3:9").is_err(), "d2 >= h");
+        assert!(parse_mpc_cascade("x:1").is_err(), "non-numeric");
+    }
+
+    #[test]
+    fn mpc_cascade_fit_is_sane_and_roundtrips() {
+        // Small seeded self-play corpus, BasicEval, a 3-row cascade (keeps
+        // the debug `cargo test` fast; the full 11-row fit is the release
+        // CLI demo). Every (phase, h, d) cell must be produced with a sane
+        // slope, σ>0 and a usable JSON that loads into a MultiProbCutConfig.
+        let dir = std::env::temp_dir();
+        let out = dir.join(format!("mpcfit_test_{}.json", std::process::id()));
+        let cascade = parse_mpc_cascade("8:4,9:3:5,10:4:6").unwrap();
+        let res = run_mpc_fit(
+            &cascade,
+            &Source::Selfplay { games: 24, seed: 2 },
+            600,
+            None,
+            &out,
+        )
+        .unwrap();
+
+        // Cascade rows: 8→{4}, 9→{3,5}, 10→{4,6} = 5 (h,d) pairs × 2 phases
+        // = 10 cells (assuming both phases sampled; corpus is late enough).
+        assert!(
+            res.cells.len() >= 8,
+            "most cells produced ({})",
+            res.cells.len()
+        );
+        // Print the real fitted table (visible with `--nocapture`); this is
+        // the canonical `run_mpc_fit` output for a representative cascade.
+        eprintln!(
+            "[mpc-fit table] cascade=8:4,9:3:5,10:4:6 source=selfplay \
+             samples<=600 seed=2 eval=basic cells={}",
+            res.cells.len()
+        );
+        eprintln!("  phase    h   d        a          b      sigma       R2      n");
+        for c in &res.cells {
+            let ph = match c.phase {
+                DiscPhase::Lt36 => "<36 ",
+                DiscPhase::Ge36 => ">=36",
+            };
+            eprintln!(
+                "  {ph}  {:>3} {:>3}  {:>9.5} {:>9.5} {:>9.5} {:>8.5} {:>6}",
+                c.h, c.d, c.fit.a, c.fit.b, c.fit.sigma, c.fit.r2, c.fit.n
+            );
+        }
+        for c in &res.cells {
+            assert!(
+                c.fit.n >= 20,
+                "cell ({:?},{},{}) n={}",
+                c.phase,
+                c.h,
+                c.d,
+                c.fit.n
+            );
+            assert!(
+                c.fit.a > 0.2 && c.fit.a < 3.0,
+                "cell ({:?},{},{}) slope a={} sane",
+                c.phase,
+                c.h,
+                c.d,
+                c.fit.a
+            );
+            assert!(c.fit.sigma > 0.0, "σ>0 for ({:?},{},{})", c.phase, c.h, c.d);
+            assert!(c.fit.r2 > 0.3, "R²={} usable", c.fit.r2);
+        }
+
+        let back = MultiProbCutConfig::load_json(&out).unwrap();
+        let _ = std::fs::remove_file(&out);
+        assert!(back.enabled, "loaded MPC config is enabled");
+        // Every fitted cell is present and usable after the JSON round-trip.
+        for c in &res.cells {
+            let p = back
+                .params_for(c.phase, c.h, c.d)
+                .unwrap_or_else(|| panic!("cell ({:?},{},{}) missing", c.phase, c.h, c.d));
+            assert!(p.is_usable(), "round-tripped cell usable");
+        }
+    }
+
+    /// Full canonical B7 cascade fit via the exact production `run_mpc_fit`
+    /// code path, printing the complete `(phase, h, d)` table. `#[ignore]`d
+    /// because a depth-13 fit over a real corpus is expensive; run
+    /// explicitly with `--ignored --nocapture` to produce the demo table.
+    /// Same command path as the CLI `probcut-fit --mpc-cascade`, just driven
+    /// from a test so the table is captured deterministically.
+    #[test]
+    #[ignore]
+    fn demo_full_b7_cascade_fit_table() {
+        let dir = std::env::temp_dir();
+        let out = dir.join(format!("mpc_demo_{}.json", std::process::id()));
+        let cascade = parse_mpc_cascade(&canonical_mpc_cascade_spec()).unwrap();
+        assert_eq!(cascade.len(), 11, "full B7 cascade");
+        // Seed 2 matches the task's demo invocation. The full B7 cascade
+        // fit recomputes 13 distinct NegaScout depths (1..=13, incl. a full
+        // depth-13 minimax) per position, so it is *very* expensive; the
+        // sample count here is kept small enough to complete in a tractable
+        // window while every (phase, h, d) cell still has a non-trivial n
+        // (the high-volume production fit is the CLI `probcut-fit
+        // --mpc-cascade --samples N` path; this just captures a real,
+        // deterministic table from the identical `run_mpc_fit` code).
+        let samples = 220;
+        let res = run_mpc_fit(
+            &cascade,
+            &Source::Selfplay {
+                games: samples,
+                seed: 2,
+            },
+            samples,
+            None,
+            &out,
+        )
+        .unwrap();
+        eprintln!(
+            "probcut-fit mpc-cascade(canonical B7) source=selfplay samples<={samples} \
+             seed=2 eval=basic T(prod)=1.0/1.4 cells={}",
+            res.cells.len()
+        );
+        eprintln!("  phase    h   d        a          b      sigma       R2      n");
+        for c in &res.cells {
+            let ph = match c.phase {
+                DiscPhase::Lt36 => "<36 ",
+                DiscPhase::Ge36 => ">=36",
+            };
+            eprintln!(
+                "  {ph}  {:>3} {:>3}  {:>9.5} {:>9.5} {:>9.5} {:>8.5} {:>6}",
+                c.h, c.d, c.fit.a, c.fit.b, c.fit.sigma, c.fit.r2, c.fit.n
+            );
+        }
+        let back = MultiProbCutConfig::load_json(&out).unwrap();
+        let _ = std::fs::remove_file(&out);
+        assert!(back.enabled);
+        // All 11 cascade rows → 13 distinct (h,d) pairs; with a small,
+        // early-game-heavy corpus the `>=36` phase may be sparse, so we
+        // only require every produced cell to be a usable round-tripped
+        // fit (per-cell statistical sanity is the dedicated unit test's
+        // job; this test's purpose is the printed demo table).
+        assert!(res.cells.len() >= 13, "cells={}", res.cells.len());
+        for c in &res.cells {
+            assert!(
+                back.params_for(c.phase, c.h, c.d).is_some(),
+                "cell ({:?},{},{}) round-trips",
+                c.phase,
+                c.h,
+                c.d
+            );
+        }
     }
 }

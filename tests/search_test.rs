@@ -43,7 +43,10 @@ fn random_position(rng: &mut ChaCha20Rng, plies: usize) -> GameState {
 }
 
 /// Full-window negascout value via the public API with explicit tables.
-fn negascout_value(s: &GameState, depth: u32, config: SearchConfig) -> i32 {
+/// Takes `config` by reference (`SearchConfig` is `Clone`, not `Copy`,
+/// since Phase 6 added the per-cell Multi-ProbCut map) and clones it into
+/// the search context, so call sites can reuse a config across a loop.
+fn negascout_value(s: &GameState, depth: u32, config: &SearchConfig) -> i32 {
     let mut tt = TranspositionTable::new();
     let mut killers = KillerTable::new();
     let z = Zobrist::new();
@@ -52,7 +55,7 @@ fn negascout_value(s: &GameState, depth: u32, config: SearchConfig) -> i32 {
         tt: &mut tt,
         killers: &mut killers,
         zobrist: &z,
-        config,
+        config: config.clone(),
         nodes: 0,
     };
     negascout(&mut ctx, s, -INF, INF, depth, 0)
@@ -72,7 +75,7 @@ fn negascout_equals_reference_negamax_property() {
         let s = random_position(&mut rng, plies);
         for depth in 1..=6u32 {
             let want = reference_negamax(&s, depth, &DiscDiffEval);
-            let got = negascout_value(&s, depth, SearchConfig::default());
+            let got = negascout_value(&s, depth, &SearchConfig::default());
             assert_eq!(
                 got, want,
                 "trial {trial} (plies={plies}) depth {depth}: \
@@ -97,7 +100,7 @@ fn tt_does_not_change_value() {
         let s = random_position(&mut rng, plies);
         for depth in 1..=6u32 {
             // (a) Fresh empty TT each call.
-            let fresh = negascout_value(&s, depth, SearchConfig::default());
+            let fresh = negascout_value(&s, depth, &SearchConfig::default());
 
             // (b) A TT pre-warmed by a *prior, deeper* search of the same
             //     position, then reused for this depth — must agree.
@@ -170,7 +173,7 @@ fn killers_and_tt_do_not_change_value() {
         let s = random_position(&mut rng, plies);
         for depth in 1..=6u32 {
             let reference = reference_negamax(&s, depth, &DiscDiffEval);
-            for cfg in configs {
+            for cfg in &configs {
                 let got = negascout_value(&s, depth, cfg);
                 assert_eq!(
                     got, reference,
@@ -220,7 +223,7 @@ fn pass_node_matches_reference() {
 
     for depth in 1..=6u32 {
         let want = reference_negamax(&s, depth, &DiscDiffEval);
-        let got = negascout_value(&s, depth, SearchConfig::default());
+        let got = negascout_value(&s, depth, &SearchConfig::default());
         assert_eq!(
             got, want,
             "must-pass depth {depth}: negascout {got} != reference {want}"

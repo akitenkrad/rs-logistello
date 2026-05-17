@@ -65,7 +65,10 @@ fn random_position(rng: &mut ChaCha20Rng, plies: usize) -> GameState {
 }
 
 /// Full-window negascout value via the public API; returns `(value, nodes)`.
-fn negascout_value_nodes(s: &GameState, depth: u32, config: SearchConfig) -> (i32, u64) {
+/// `config` is taken by reference (`SearchConfig` became `Clone`-not-`Copy`
+/// when Phase 6 added the per-cell Multi-ProbCut map) and cloned into the
+/// context so it can be reused across a loop.
+fn negascout_value_nodes(s: &GameState, depth: u32, config: &SearchConfig) -> (i32, u64) {
     let mut tt = TranspositionTable::new();
     let mut killers = KillerTable::new();
     let z = Zobrist::new();
@@ -74,7 +77,7 @@ fn negascout_value_nodes(s: &GameState, depth: u32, config: SearchConfig) -> (i3
         tt: &mut tt,
         killers: &mut killers,
         zobrist: &z,
-        config,
+        config: config.clone(),
         nodes: 0,
     };
     let v = negascout(&mut ctx, s, -INF, INF, depth, 0);
@@ -91,7 +94,7 @@ fn negascout_value_nodes(s: &GameState, depth: u32, config: SearchConfig) -> (i3
 /// tests both correct and tractable for the deliberately weak
 /// `DiscDiffEval` (unpruned depth-9 negamax is astronomically slower).
 fn exact_full(s: &GameState, depth: u32) -> i32 {
-    negascout_value_nodes(s, depth, SearchConfig::default()).0
+    negascout_value_nodes(s, depth, &SearchConfig::default()).0
 }
 
 /// A plausible single-ProbCut config for the trivial `DiscDiffEval`:
@@ -133,7 +136,7 @@ fn probcut_off_is_byte_identical_to_phase2() {
         //     deep exactness is `search_test.rs`'s responsibility.
         for depth in [1u32, 3, 5] {
             let reference = reference_negamax(&s, depth, &DiscDiffEval);
-            let (off, _) = negascout_value_nodes(&s, depth, SearchConfig::default());
+            let (off, _) = negascout_value_nodes(&s, depth, &SearchConfig::default());
             assert_eq!(
                 off, reference,
                 "trial {trial} depth {depth}: ProbCut-OFF {off} != reference {reference}"
@@ -150,8 +153,8 @@ fn probcut_off_is_byte_identical_to_phase2() {
             probcut,
             ..SearchConfig::default()
         };
-        let (gated, gn) = negascout_value_nodes(&s, 9, gated_cfg);
-        let (off9, on9) = negascout_value_nodes(&s, 9, SearchConfig::default());
+        let (gated, gn) = negascout_value_nodes(&s, 9, &gated_cfg);
+        let (off9, on9) = negascout_value_nodes(&s, 9, &SearchConfig::default());
         assert_eq!(
             gated, off9,
             "trial {trial} depth 9: gated-OFF {gated} != default-OFF {off9}"
@@ -183,7 +186,7 @@ fn unusable_params_fall_through_to_exact() {
             continue;
         }
         let exact = exact_full(&s, 9);
-        let (got, _) = negascout_value_nodes(&s, 9, cfg);
+        let (got, _) = negascout_value_nodes(&s, 9, &cfg);
         assert_eq!(
             got, exact,
             "trial {trial}: unusable-params ProbCut must fall through to exact"
@@ -226,8 +229,8 @@ fn probcut_on_agrees_statistically_with_full_depth() {
         }
         // "Full depth-9 value" = the exact ProbCut-OFF NegaScout (proven
         // == unpruned reference by search_test.rs; fast enough at depth 9).
-        let (full, fn_) = negascout_value_nodes(&s, 9, SearchConfig::default());
-        let (pc, pn) = negascout_value_nodes(&s, 9, cfg);
+        let (full, fn_) = negascout_value_nodes(&s, 9, &SearchConfig::default());
+        let (pc, pn) = negascout_value_nodes(&s, 9, &cfg);
         nodes_full += fn_;
         nodes_pc += pn;
         n += 1;
@@ -297,8 +300,8 @@ fn probcut_on_searches_fewer_nodes() {
         if s.is_terminal() {
             continue;
         }
-        let (_, no) = negascout_value_nodes(&s, 9, off);
-        let (_, ny) = negascout_value_nodes(&s, 9, on);
+        let (_, no) = negascout_value_nodes(&s, 9, &off);
+        let (_, ny) = negascout_value_nodes(&s, 9, &on);
         nodes_off += no;
         nodes_on += ny;
         n += 1;
@@ -382,7 +385,7 @@ fn probcut_never_changes_terminal_or_must_pass_values() {
     // confounding it with legitimate ProbCut firing on deeper children.
     for depth in [1u32, 4, 7] {
         let want = reference_negamax(&s, depth, &DiscDiffEval);
-        let (got, _) = negascout_value_nodes(&s, depth, cfg);
+        let (got, _) = negascout_value_nodes(&s, depth, &cfg);
         assert_eq!(
             got, want,
             "must-pass depth {depth}: ProbCut must not alter a pass node \
@@ -405,7 +408,7 @@ fn probcut_never_changes_terminal_or_must_pass_values() {
     t.side_to_move = Color::Black;
     t.consecutive_passes = 2;
     assert!(t.is_terminal());
-    let (got, _) = negascout_value_nodes(&t, 8, cfg);
+    let (got, _) = negascout_value_nodes(&t, 8, &cfg);
     assert_eq!(
         got,
         reference_negamax(&t, 8, &DiscDiffEval),

@@ -28,6 +28,7 @@ use logistello_eval::LeafEvaluator;
 use othello_core::{GameState, Move};
 
 use crate::killer::KillerTable;
+use crate::multi_probcut::{DiscPhase, MultiProbCutConfig, stages_for_height};
 use crate::probcut::{ProbCutConfig, probcut_bounds};
 use crate::tt::{Bound, Entry, TranspositionTable};
 
@@ -36,10 +37,15 @@ use crate::tt::{Bound, Entry, TranspositionTable};
 pub const INF: i32 = 1_000_000;
 
 /// Tunable search behaviour. Defaults enable every (value-preserving)
-/// ordering heuristic and keep ProbCut **off**, so a default config
-/// reproduces the Phase 2/3 NegaScout exactly (every soundness invariant
-/// holds); tests flip individual flags to assert invariance.
-#[derive(Debug, Clone, Copy)]
+/// ordering heuristic and keep both ProbCut and Multi-ProbCut **off**, so a
+/// default config reproduces the Phase 2/3/5 NegaScout exactly (every
+/// soundness invariant holds); tests flip individual flags to assert
+/// invariance.
+///
+/// `SearchConfig` is [`Clone`] but not `Copy` because
+/// [`MultiProbCutConfig`] owns a per-cell coefficient map. The OFF default
+/// keeps that map empty, so cloning a default config is cheap.
+#[derive(Debug, Clone)]
 pub struct SearchConfig {
     /// Use the transposition table for cutoffs / move ordering.
     pub use_tt: bool,
@@ -53,6 +59,17 @@ pub struct SearchConfig {
     /// minimax equality for speed, so the correct invariant becomes
     /// statistical agreement, never byte equality.
     pub probcut: ProbCutConfig,
+    /// Multi-ProbCut cascade configuration (design doc §4.3.5 / §4.5 B7).
+    ///
+    /// [`MultiProbCutConfig::default`] is **disabled**; when disabled the
+    /// search is byte-identical to the Phase 2/5 NegaScout (single ProbCut,
+    /// if enabled, still applies independently). When MPC is enabled it
+    /// **supersedes single ProbCut at every height present in the cascade**
+    /// (`3..=13`); heights / depths outside the cascade fall back to the
+    /// normal search. MPC is *strictly looser* than single ProbCut (it
+    /// compounds several unsound cuts), so the correct on-invariant is
+    /// statistical agreement, never byte equality.
+    pub multi_probcut: MultiProbCutConfig,
 }
 
 impl Default for SearchConfig {
@@ -61,6 +78,7 @@ impl Default for SearchConfig {
             use_tt: true,
             use_killers: true,
             probcut: ProbCutConfig::default(),
+            multi_probcut: MultiProbCutConfig::default(),
         }
     }
 }
@@ -195,53 +213,49 @@ pub fn negascout<E: LeafEvaluator>(
         }
     }
 
-    // --- Single ProbCut (design doc §4.3.4 / §4.5 B7) ---------------------
+    // --- Selective forward pruning: Multi-ProbCut / single ProbCut --------
     //
-    // Attempted at an *interior* node whose remaining height is exactly
-    // `h` (the canonical 8), when ProbCut is enabled and a usable
-    // coefficient cell exists for this node's disc-count phase. By
-    // construction this is reached only **after** the terminal (step 1),
-    // must-pass (step 2) and horizon (step 3) returns, so ProbCut never
-    // fires on a terminal or must-pass node. It also runs after the TT
-    // narrowing, so it composes with the TT (the probes recurse through
-    // the full `negascout`, sharing the same TT/killers). The exact
-    // endgame solver runs with a default `SearchConfig` (ProbCut OFF), so
-    // ProbCut can never bypass the Phase-3 exact endgame search.
+    // Both are attempted at an *interior* node, reached only **after** the
+    // terminal (step 1), must-pass (step 2) and horizon (step 3) returns —
+    // so neither ever fires on a terminal or must-pass node — and **after**
+    // the TT narrowing, so the probes recurse through the full `negascout`
+    // and share the same TT/killers. The Phase-3 exact endgame solver runs
+    // with a default `SearchConfig` (both OFF), so neither can bypass exact
+    // endgame play.
     //
-    // ProbCut is intentionally unsound: the depth-`d` probe predicts the
-    // depth-`h` value only up to the regression's residual σ, so on a
+    // Precedence (design doc §4.3.5 / §4.5 B7): if Multi-ProbCut is enabled
+    // and the node's remaining height `depth` is one of the cascade heights
+    // (`3..=13`), the MPC cascade runs and **supersedes** single ProbCut at
+    // that height; on fall-through the normal full-depth search continues
+    // (single ProbCut is *not* additionally attempted, MPC owns this
+    // height). Heights outside the cascade — and the case where MPC is
+    // disabled — fall back to the Phase-5 single ProbCut at its own height
+    // `pc.h`, exactly as before (byte-identical when MPC is off).
+    //
+    // Both are intentionally unsound: the shallow depth-`d` probe predicts
+    // the depth-`h` value only up to the regression's residual σ, so on a
     // fraction of nodes the returned `beta`/`alpha` differs from the true
-    // minimax value. This is the deliberate speed/accuracy trade-off; the
-    // correct on-invariant is statistical agreement, never equality.
+    // minimax value. MPC additionally compounds several such cuts and uses
+    // the more aggressive production thresholds, so it is *strictly looser*
+    // than single ProbCut. The correct on-invariant is statistical
+    // agreement, never equality.
     {
-        let pc = &ctx.config.probcut;
-        if pc.enabled && depth == pc.h && pc.d < depth {
-            let discs = 64 - state.board.empty_count();
-            let params = *pc.params_for_discs(discs);
-            if params.is_usable() {
-                let (bound_low, bound_high) = probcut_bounds(&params, pc.t, alpha, beta);
-                let probe_depth = pc.d;
-
-                // Probe 1: probable fail-high. Null window just below
-                // `bound_high`. `bound_high - 1` is safe: `probcut_bounds`
-                // clamps to ±INF, so the synthesised window stays in i32.
-                if bound_high < INF {
-                    let v = negascout(ctx, state, bound_high - 1, bound_high, probe_depth, ply + 1);
-                    if v >= bound_high {
-                        // Probable β-cut; do not pollute the TT with this
-                        // unsound bound (keep the table sound for the
-                        // ProbCut-OFF invariants).
-                        return beta;
-                    }
-                }
-
-                // Probe 2: probable fail-low. Null window just above
-                // `bound_low`.
-                if bound_low > -INF {
-                    let v = negascout(ctx, state, bound_low, bound_low + 1, probe_depth, ply + 1);
-                    if v <= bound_low {
-                        return alpha;
-                    }
+        let mpc = &ctx.config.multi_probcut;
+        let mpc_owns_height = mpc.enabled && !stages_for_height(depth).is_empty();
+        if mpc_owns_height {
+            if let Some(cut) = multi_probcut_cascade(ctx, state, alpha, beta, depth, ply) {
+                return cut;
+            }
+            // All cascade stages fell through: normal full-depth search
+            // below (MPC superseded single ProbCut for this height).
+        } else {
+            let pc = ctx.config.probcut;
+            if pc.enabled && depth == pc.h && pc.d < depth {
+                let discs = 64 - state.board.empty_count();
+                let params = *pc.params_for_discs(discs);
+                if let Some(cut) = probcut_probe(ctx, state, alpha, beta, &params, pc.t, pc.d, ply)
+                {
+                    return cut;
                 }
                 // Fall through: normal full-depth-`h` NegaScout below.
             }
@@ -312,6 +326,96 @@ pub fn negascout<E: LeafEvaluator>(
     }
 
     best
+}
+
+/// One single-ProbCut primitive (design doc §4.3.4 pseudocode): the two
+/// null-window depth-`d` probes for the coefficient cell `params` at
+/// confidence `t`, against the search window `(alpha, beta)`.
+///
+/// Returns `Some(beta)` on a probable fail-high, `Some(alpha)` on a probable
+/// fail-low, or `None` to fall through to the normal full-depth search.
+/// `params` must be usable (caller's responsibility); an unusable cell is a
+/// no-op (`None`). Probes recurse through the full [`negascout`] so they
+/// share the TT / killers; the probe value is intentionally *not* stored in
+/// the TT (it is an unsound bound; keeping it out preserves the ProbCut-OFF
+/// soundness invariants). This is the exact primitive design doc §4.3.5
+/// reuses per Multi-ProbCut stage.
+#[allow(clippy::too_many_arguments)]
+fn probcut_probe<E: LeafEvaluator>(
+    ctx: &mut SearchContext<'_, E>,
+    state: &GameState,
+    alpha: i32,
+    beta: i32,
+    params: &crate::probcut::ProbCutParams,
+    t: f64,
+    d: u32,
+    ply: usize,
+) -> Option<i32> {
+    if !params.is_usable() {
+        return None;
+    }
+    let (bound_low, bound_high) = probcut_bounds(params, t, alpha, beta);
+
+    // Probe 1: probable fail-high. Null window just below `bound_high`.
+    // `bound_high - 1` is safe: `probcut_bounds` clamps to ±INF.
+    if bound_high < INF {
+        let v = negascout(ctx, state, bound_high - 1, bound_high, d, ply + 1);
+        if v >= bound_high {
+            return Some(beta);
+        }
+    }
+    // Probe 2: probable fail-low. Null window just above `bound_low`.
+    if bound_low > -INF {
+        let v = negascout(ctx, state, bound_low, bound_low + 1, d, ply + 1);
+        if v <= bound_low {
+            return Some(alpha);
+        }
+    }
+    None
+}
+
+/// The Multi-ProbCut cascade for a node whose remaining height is `depth`
+/// (design doc §4.3.5 `MultiProbCut` + §4.5 B7).
+///
+/// For each check depth `d` in [`stages_for_height`]`(depth)` (ordered
+/// shallow→deep, `d₁` then `d₂`) it runs the single-ProbCut primitive
+/// [`probcut_probe`] for this node's disc-count phase coefficient cell with
+/// the production threshold `T = t_for_discs(discs)`. The moment any stage
+/// returns a cut (`β` or `α`) the cascade returns it; if every stage falls
+/// through it returns `None` (caller continues with the normal full-depth
+/// NegaScout). Stages whose `(phase, depth, d)` cell is missing / unusable
+/// are skipped (they fall through, not cut), so an unfitted cascade is a
+/// no-op.
+fn multi_probcut_cascade<E: LeafEvaluator>(
+    ctx: &mut SearchContext<'_, E>,
+    state: &GameState,
+    alpha: i32,
+    beta: i32,
+    depth: u32,
+    ply: usize,
+) -> Option<i32> {
+    let discs = 64 - state.board.empty_count();
+    let phase = DiscPhase::for_discs(discs);
+    let t = ctx.config.multi_probcut.t_for_discs(discs);
+    for &d in stages_for_height(depth) {
+        // A stage's check depth must be a strictly shallower search than the
+        // height (`d < depth`); the B7 cascade always satisfies this, but we
+        // guard defensively so a hand-edited config can never recurse at the
+        // same or a deeper depth.
+        if d >= depth {
+            continue;
+        }
+        let params = match ctx.config.multi_probcut.params_for(phase, depth, d) {
+            // Reuse the Phase-5 single-ProbCut primitive: the per-stage
+            // `(a, b, σ)` is the same regression triple type.
+            Some(p) => crate::probcut::ProbCutParams::new(p.a, p.b, p.sigma),
+            None => continue, // unfitted cell → skip this stage
+        };
+        if let Some(cut) = probcut_probe(ctx, state, alpha, beta, &params, t, d, ply) {
+            return Some(cut);
+        }
+    }
+    None
 }
 
 #[cfg(test)]

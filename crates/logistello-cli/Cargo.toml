@@ -29,6 +29,10 @@ name = "probcut_test"
 path = "../../tests/probcut_test.rs"
 
 [[test]]
+name = "multi_probcut_test"
+path = "../../tests/multi_probcut_test.rs"
+
+[[test]]
 name = "endgame_test"
 path = "../../tests/endgame_test.rs"
 

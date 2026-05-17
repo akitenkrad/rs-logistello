@@ -24,6 +24,7 @@ use crate::alphabeta::SearchConfig;
 use crate::endgame::{best_endgame_move, solve_wld};
 use crate::iterative::{SearchResult, search_with};
 use crate::killer::KillerTable;
+use crate::multi_probcut::MultiProbCutConfig;
 use crate::probcut::ProbCutConfig;
 use crate::tt::TranspositionTable;
 
@@ -36,7 +37,11 @@ pub const DEFAULT_ENDGAME_EMPTIES: u32 = 20;
 pub const DEFAULT_MAX_DEPTH: u32 = 8;
 
 /// Engine configuration (design doc §4.5 B8 / §6 sensitivity target).
-#[derive(Debug, Clone, Copy)]
+///
+/// [`Clone`] but not `Copy` because [`MultiProbCutConfig`] owns a per-cell
+/// coefficient map (the OFF default keeps it empty, so a default clone is
+/// cheap).
+#[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Selective-midgame iterative-deepening max depth (plies).
     pub max_depth: u32,
@@ -51,6 +56,11 @@ pub struct EngineConfig {
     /// [`ProbCutConfig::default`] is **disabled** so the default engine is
     /// exactly the Phase 3 selective-midgame search.
     pub probcut: ProbCutConfig,
+    /// Multi-ProbCut cascade configuration (design doc §4.3.5 / §4.5 B7).
+    /// [`MultiProbCutConfig::default`] is **disabled** so the default engine
+    /// is exactly the Phase 3 selective-midgame search; when enabled it
+    /// supersedes single ProbCut at the cascade heights (`3..=13`).
+    pub multi_probcut: MultiProbCutConfig,
 }
 
 impl Default for EngineConfig {
@@ -61,6 +71,7 @@ impl Default for EngineConfig {
             use_tt: true,
             use_killers: true,
             probcut: ProbCutConfig::default(),
+            multi_probcut: MultiProbCutConfig::default(),
         }
     }
 }
@@ -72,8 +83,10 @@ impl EngineConfig {
         SearchConfig {
             use_tt: self.use_tt,
             use_killers: self.use_killers,
-            // ProbCut wired through the engine config (design doc §4.5 B7).
+            // ProbCut + Multi-ProbCut wired through the engine config
+            // (design doc §4.5 B7). Both default OFF.
             probcut: self.probcut,
+            multi_probcut: self.multi_probcut.clone(),
         }
     }
 }
@@ -328,7 +341,7 @@ mod tests {
             max_depth: 4,
             ..EngineConfig::default()
         };
-        let mut p1 = LogistelloPlayer::new(Color::Black, cfg);
+        let mut p1 = LogistelloPlayer::new(Color::Black, cfg.clone());
         let mut p2 = LogistelloPlayer::new(Color::Black, cfg);
         let m1 = p1.select_move(&s).unwrap();
         let m2 = p2.select_move(&s).unwrap();

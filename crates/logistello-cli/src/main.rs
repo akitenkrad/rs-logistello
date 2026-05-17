@@ -19,7 +19,7 @@ use logistello_eval::{DiscDiffEval, EvalWeights};
 use logistello_search::alphabeta::{INF, SearchConfig, SearchContext, negascout};
 use logistello_search::killer::KillerTable;
 use logistello_search::tt::TranspositionTable;
-use logistello_search::{EngineConfig, LogistelloPlayer, ProbCutConfig};
+use logistello_search::{EngineConfig, LogistelloPlayer, MultiProbCutConfig, ProbCutConfig};
 use othello_core::{Color, GameState, Move};
 use othello_engine::{EngineConfig as GameEngineConfig, GameEngine};
 use othello_player::{GreedyPlayer, Player, RandomPlayer};
@@ -83,11 +83,22 @@ enum Command {
         /// coefficients, so ProbCut would just fall through).
         #[arg(long)]
         probcut_params: Option<PathBuf>,
+        /// Enable Multi-ProbCut for the `engine` player (design doc §4.3.5 /
+        /// §4.5 B7). Off by default. When on it supersedes single ProbCut at
+        /// the cascade heights (`3..=13`). Composes with `--eval-weights`
+        /// (production path = PatternEval + MPC + exact endgame).
+        #[arg(long, default_value_t = false)]
+        mpc: bool,
+        /// Multi-ProbCut params JSON (a `probcut-fit --mpc-cascade` output).
+        /// Required for a meaningful `--mpc` run.
+        #[arg(long)]
+        mpc_params: Option<PathBuf>,
     },
     /// Benchmark the Phase 2 search from the standard opening using the
-    /// trivial disc-difference evaluator. `--probcut` runs the same nominal
-    /// depth with single ProbCut enabled so the speedup vs the exact search
-    /// is observable (`probcut_speedup`, design doc §4.3.8 / §5).
+    /// trivial disc-difference evaluator. `--probcut` / `--mpc` run the same
+    /// nominal depth with single ProbCut / Multi-ProbCut enabled so the
+    /// speedup vs the exact search is observable (`probcut_speedup`, design
+    /// doc §4.3.8 / §5).
     BenchSearch {
         /// Maximum iterative-deepening depth (plies).
         #[arg(long, default_value_t = 8)]
@@ -105,14 +116,24 @@ enum Command {
         /// ProbCut params JSON (a `probcut-fit` output).
         #[arg(long)]
         probcut_params: Option<PathBuf>,
-        /// Run BOTH a ProbCut-off and a ProbCut-on search at `--depth` from
-        /// the same position and report the `probcut_speedup`
-        /// (nodes/time ratio; design doc §4.3.8 / §5). Implies a
-        /// `--probcut-params` file for the on-run.
+        /// Enable Multi-ProbCut at the same nominal depth (design doc
+        /// §4.3.5 / §4.5 B7). Off by default.
+        #[arg(long, default_value_t = false)]
+        mpc: bool,
+        /// Multi-ProbCut params JSON (a `probcut-fit --mpc-cascade` output).
+        #[arg(long)]
+        mpc_params: Option<PathBuf>,
+        /// Run a full-vs-single-ProbCut-vs-MPC comparison at `--depth` from
+        /// the same position and report node/time and speedup factors (the
+        /// §5 comparisons; design doc §4.3.8 / §5). Uses `--probcut-params`
+        /// for the single-ProbCut run and `--mpc-params` for the MPC run
+        /// (each optional; a run is skipped with a note if its file is
+        /// absent).
         #[arg(long, default_value_t = false)]
         speedup: bool,
         /// Plies of seeded random play before benchmarking (a midgame
-        /// position exercises h=8 ProbCut nodes; 0 = standard opening).
+        /// position exercises h=8 ProbCut / cascade nodes; 0 = standard
+        /// opening).
         #[arg(long, default_value_t = 0)]
         from_plies: usize,
         /// Seed for the `--from-plies` random walk.
@@ -146,17 +167,27 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Fit single-ProbCut `(a, b, σ)` coefficients (Phase 5; design doc
-    /// §4.3.4 / §4.5 B7). For every sampled position it measures
-    /// `v_d = NegaScout(d)` and `v_h = NegaScout(h)` under the production TT
-    /// discipline (ProbCut OFF), stratifies by disc phase (`< 36` vs
-    /// `≥ 36`), fits OLS `v_h = a·v_d + b` per phase, and writes a
-    /// `ProbCutConfig`-compatible JSON file.
+    /// Fit ProbCut / Multi-ProbCut `(a, b, σ)` coefficients (Phase 5/6;
+    /// design doc §4.3.4 / §4.3.5 / §4.5 B7). For every sampled position it
+    /// measures the true `v_x = NegaScout(x)` for each needed depth under
+    /// the production TT discipline (ProbCut/MPC OFF), stratifies by disc
+    /// phase (`< 36` vs `≥ 36`), and fits OLS `v_h = a·v_d + b` per group.
+    ///
+    /// Without `--mpc-cascade`: a single-pair `(d, h)` fit → a
+    /// `ProbCutConfig` JSON (Phase 5, unchanged). With `--mpc-cascade`: an
+    /// independent OLS per `(disc-phase, h, d)` cascade cell → a
+    /// `MultiProbCutConfig` JSON (Phase 6).
     ProbcutFit {
         /// Shallow:deep depth pair `d:h` (design doc §4.5 B7 single
-        /// ProbCut = `4:8`).
+        /// ProbCut = `4:8`). Used when `--mpc-cascade` is absent.
         #[arg(long, default_value = "4:8")]
         single_pair: String,
+        /// Multi-ProbCut cascade spec `h:d1[:d2],...` (design doc §4.5 B7,
+        /// canonical = `3:1,4:2,5:1,6:2,7:3,8:4,9:3:5,10:4:6,11:3:5,12:4,13:5`).
+        /// When given, a `(disc-phase, h, d)` cascade fit is run instead of
+        /// the single-pair fit and a `MultiProbCutConfig` JSON is written.
+        #[arg(long)]
+        mpc_cascade: Option<String>,
         /// Corpus: `selfplay` (seeded `RandomPlayer` self-play, no external
         /// data) or `wthor` (real `.wtb` expert games).
         #[arg(long, default_value = "selfplay")]
@@ -175,11 +206,14 @@ enum Command {
         /// with the pattern evaluator).
         #[arg(long)]
         eval_weights: Option<PathBuf>,
-        /// Per-σ confidence `T` written into the config (design doc §4.5
-        /// B7: 1.5).
+        /// Per-σ confidence `T` written into the (single) `ProbCutConfig`
+        /// (design doc §4.5 B7: 1.5). Ignored for `--mpc-cascade` (the MPC
+        /// config carries the canonical 2-phase production thresholds
+        /// 1.0 / 1.4).
         #[arg(long, default_value_t = 1.5)]
         probcut_t: f64,
-        /// Output JSON path (`ProbCutConfig`-compatible).
+        /// Output JSON path (`ProbCutConfig`- or, with `--mpc-cascade`,
+        /// `MultiProbCutConfig`-compatible).
         #[arg(long)]
         output: PathBuf,
     },
@@ -266,15 +300,15 @@ impl Player for CliPlayer {
 fn make_player(
     kind: &str,
     color: Color,
-    cfg: EngineConfig,
+    cfg: &EngineConfig,
     seed: u64,
     learned: Option<&logistello_eval::PatternEval>,
 ) -> Result<CliPlayer> {
     match kind {
         "engine" => {
             let p = match learned {
-                Some(pe) => LogistelloPlayer::with_pattern(color, cfg, pe.clone()),
-                None => LogistelloPlayer::new(color, cfg),
+                Some(pe) => LogistelloPlayer::with_pattern(color, cfg.clone(), pe.clone()),
+                None => LogistelloPlayer::new(color, cfg.clone()),
             };
             Ok(CliPlayer::Engine(Box::new(p)))
         }
@@ -315,6 +349,33 @@ fn build_probcut(
     };
     cfg.enabled = true;
     cfg.t = t;
+    Ok(cfg)
+}
+
+/// Builds the [`MultiProbCutConfig`] for a CLI run (Phase 6).
+///
+/// The default keeps MPC OFF (Phase 2/3/5 behaviour unchanged). `--mpc`
+/// turns it on; if `--mpc-params FILE` is given the fitted cascade
+/// coefficients are loaded from it, otherwise the built-in unfitted config
+/// is used (which simply falls through — a warning is printed). The loaded
+/// config keeps its canonical 2-phase production thresholds (1.0 / 1.4).
+fn build_multi_probcut(enable: bool, params: Option<&PathBuf>) -> Result<MultiProbCutConfig> {
+    if !enable {
+        return Ok(MultiProbCutConfig::default()); // OFF
+    }
+    let mut cfg = match params {
+        Some(p) => MultiProbCutConfig::load_json(p)
+            .map_err(|e| anyhow::anyhow!("load mpc params {}: {e}", p.display()))?,
+        None => {
+            eprintln!(
+                "warning: --mpc without --mpc-params: no fitted cascade \
+                 coefficients, Multi-ProbCut will fall through to the exact \
+                 search"
+            );
+            MultiProbCutConfig::default()
+        }
+    };
+    cfg.enabled = true;
     Ok(cfg)
 }
 
@@ -363,14 +424,20 @@ fn walk_position(plies: usize, seed: u64) -> GameState {
     s
 }
 
-/// One fixed-depth NegaScout from `root` with the given ProbCut config,
-/// returning `(value, nodes, elapsed_secs)`.
-fn bench_one(root: &GameState, depth: u32, pc: ProbCutConfig) -> (i32, u64, f64) {
+/// One fixed-depth NegaScout from `root` with the given ProbCut + MPC
+/// config, returning `(value, nodes, elapsed_secs)`.
+fn bench_one(
+    root: &GameState,
+    depth: u32,
+    pc: ProbCutConfig,
+    mpc: MultiProbCutConfig,
+) -> (i32, u64, f64) {
     let mut tt = TranspositionTable::new();
     let mut killers = KillerTable::new();
     let z = Zobrist::new();
     let cfg = SearchConfig {
         probcut: pc,
+        multi_probcut: mpc,
         ..SearchConfig::default()
     };
     let mut ctx = SearchContext {
@@ -401,12 +468,16 @@ fn main() -> Result<()> {
             no_probcut,
             probcut_t,
             probcut_params,
+            mpc,
+            mpc_params,
         } => {
             let pc = build_probcut(probcut, no_probcut, probcut_t, probcut_params.as_ref())?;
+            let mpc_cfg = build_multi_probcut(mpc, mpc_params.as_ref())?;
             let cfg = EngineConfig {
                 max_depth: depth,
                 endgame_empties,
                 probcut: pc,
+                multi_probcut: mpc_cfg.clone(),
                 ..EngineConfig::default()
             };
             let learned = match &eval_weights {
@@ -417,8 +488,8 @@ fn main() -> Result<()> {
                 }
                 None => None,
             };
-            let mut black_player = make_player(&black, Color::Black, cfg, seed, learned.as_ref())?;
-            let mut white_player = make_player(&white, Color::White, cfg, seed, learned.as_ref())?;
+            let mut black_player = make_player(&black, Color::Black, &cfg, seed, learned.as_ref())?;
+            let mut white_player = make_player(&white, Color::White, &cfg, seed, learned.as_ref())?;
 
             let mut engine = GameEngine::new(GameEngineConfig::standard())?;
             let result = engine
@@ -446,10 +517,20 @@ fn main() -> Result<()> {
             } else {
                 "off".to_string()
             };
+            let mpc_kind = if mpc_cfg.enabled {
+                format!(
+                    "on(T={}/{},cells={})",
+                    mpc_cfg.t_lt36,
+                    mpc_cfg.t_ge36,
+                    mpc_cfg.cell_count()
+                )
+            } else {
+                "off".to_string()
+            };
             println!(
                 "play black={black} white={white} depth={depth} \
                  endgame_empties={endgame_empties} seed={seed} eval={eval_kind} \
-                 probcut={pc_kind}"
+                 probcut={pc_kind} mpc={mpc_kind}"
             );
             println!("moves: {}", moves.join(" "));
             println!(
@@ -463,6 +544,8 @@ fn main() -> Result<()> {
             no_probcut,
             probcut_t,
             probcut_params,
+            mpc,
+            mpc_params,
             speedup,
             from_plies,
             seed,
@@ -477,38 +560,78 @@ fn main() -> Result<()> {
             };
 
             if speedup {
-                // probcut_speedup (design doc §4.3.8 / §5): same nominal
-                // depth, ProbCut OFF vs ON, same root.
-                let off = ProbCutConfig::default();
-                let on = build_probcut(true, false, probcut_t, probcut_params.as_ref())?;
-                let (v_off, n_off, t_off) = bench_one(&root, depth, off);
-                let (v_on, n_on, t_on) = bench_one(&root, depth, on);
-                let node_ratio = n_on as f64 / (n_off.max(1) as f64);
-                let time_speedup = if t_on > 0.0 { t_off / t_on } else { 0.0 };
-                println!("probcut-bench depth={depth} from_plies={from_plies} seed={seed}");
+                // The §5 comparison (design doc §4.3.8 / §5): same nominal
+                // depth and root, full search vs single ProbCut vs
+                // Multi-ProbCut. Single / MPC runs use their respective
+                // params files (each skipped with a note if absent).
+                let (v_off, n_off, t_off) = bench_one(
+                    &root,
+                    depth,
+                    ProbCutConfig::default(),
+                    MultiProbCutConfig::default(),
+                );
+                println!("bench-search depth={depth} from_plies={from_plies} seed={seed}");
                 println!(
-                    "  off: value={v_off} nodes={n_off} time={t_off:.3}s nps={}",
+                    "  full  : value={v_off} nodes={n_off} time={t_off:.3}s nps={}",
                     nps(n_off, t_off)
                 );
-                println!(
-                    "  on : value={v_on} nodes={n_on} time={t_on:.3}s nps={}",
-                    nps(n_on, t_on)
-                );
-                println!(
-                    "  probcut_speedup: node_ratio(on/off)={node_ratio:.4} \
-                     node_reduction={:.1}% time_speedup(off/on)={time_speedup:.2}x \
-                     value_delta={}",
-                    (1.0 - node_ratio) * 100.0,
-                    v_on - v_off
-                );
+
+                // Single ProbCut.
+                let (n_single, single_done) = if probcut_params.is_some() {
+                    let pc = build_probcut(true, false, probcut_t, probcut_params.as_ref())?;
+                    let (v, n, t) = bench_one(&root, depth, pc, MultiProbCutConfig::default());
+                    let r = n as f64 / n_off.max(1) as f64;
+                    println!(
+                        "  single: value={v} nodes={n} time={t:.3}s nps={} \
+                         node_ratio(vs full)={r:.4} reduction={:.1}% \
+                         time_speedup(full/single)={:.2}x value_delta={}",
+                        nps(n, t),
+                        (1.0 - r) * 100.0,
+                        if t > 0.0 { t_off / t } else { 0.0 },
+                        v - v_off
+                    );
+                    (n, true)
+                } else {
+                    println!("  single: skipped (no --probcut-params)");
+                    (0, false)
+                };
+
+                // Multi-ProbCut.
+                if mpc_params.is_some() {
+                    let mc = build_multi_probcut(true, mpc_params.as_ref())?;
+                    let (v, n, t) = bench_one(&root, depth, ProbCutConfig::default(), mc);
+                    let r_full = n as f64 / n_off.max(1) as f64;
+                    println!(
+                        "  mpc   : value={v} nodes={n} time={t:.3}s nps={} \
+                         node_ratio(vs full)={r_full:.4} reduction={:.1}% \
+                         time_speedup(full/mpc)={:.2}x value_delta={}",
+                        nps(n, t),
+                        (1.0 - r_full) * 100.0,
+                        if t > 0.0 { t_off / t } else { 0.0 },
+                        v - v_off
+                    );
+                    if single_done && n_single > 0 {
+                        let factor = n_single as f64 / n.max(1) as f64;
+                        println!(
+                            "  speedup_ordering: nodes(full={n_off}) > \
+                             nodes(single={n_single}) ? {}  ;  MPC vs single \
+                             node_factor={factor:.3}x (§5 target ≈1.5×, ≥1.3×)",
+                            n_off > n_single
+                        );
+                    }
+                } else {
+                    println!("  mpc   : skipped (no --mpc-params)");
+                }
             } else {
                 let pc = build_probcut(probcut, no_probcut, probcut_t, probcut_params.as_ref())?;
-                let (value, nodes, secs) = bench_one(&root, depth, pc);
+                let mc = build_multi_probcut(mpc, mpc_params.as_ref())?;
+                let (value, nodes, secs) = bench_one(&root, depth, pc, mc.clone());
                 let pc_kind = if pc.enabled { "on" } else { "off" };
+                let mpc_kind = if mc.enabled { "on" } else { "off" };
                 println!(
                     "bench-search depth={depth} from_plies={from_plies} \
-                     probcut={pc_kind} value={value} nodes={nodes} \
-                     time={secs:.3}s nps={}",
+                     probcut={pc_kind} mpc={mpc_kind} value={value} \
+                     nodes={nodes} time={secs:.3}s nps={}",
                     nps(nodes, secs)
                 );
             }
@@ -544,6 +667,7 @@ fn main() -> Result<()> {
         }
         Command::ProbcutFit {
             single_pair,
+            mpc_cascade,
             source,
             wthor_dir,
             samples,
@@ -552,7 +676,6 @@ fn main() -> Result<()> {
             probcut_t,
             output,
         } => {
-            let (d, h) = parse_pair(&single_pair)?;
             let src = match source.as_str() {
                 "selfplay" => probcut_fit::Source::Selfplay {
                     games: samples, // one position per game minimum; capped by samples
@@ -569,29 +692,66 @@ fn main() -> Result<()> {
                 }
                 other => bail!("unknown --source '{other}' (want selfplay|wthor)"),
             };
-            let res = probcut_fit::run_fit(
-                d,
-                h,
-                &src,
-                samples,
-                eval_weights.as_deref(),
-                probcut_t,
-                &output,
-            )?;
             let eval_kind = match &eval_weights {
                 Some(p) => format!("pattern({})", p.display()),
                 None => "basic".to_string(),
             };
-            println!(
-                "probcut-fit single-pair={d}:{h} source={source} samples<={samples} \
-                 seed={seed} eval={eval_kind} T={probcut_t} output={}",
-                output.display()
-            );
-            for (name, ph) in [("phase<36", res.lt36), ("phase>=36", res.ge36)] {
-                println!(
-                    "  {name}: a={:.6} b={:.6} sigma={:.6} R2={:.6} n={}",
-                    ph.a, ph.b, ph.sigma, ph.r2, ph.n
-                );
+
+            match &mpc_cascade {
+                // ---- Phase 6: Multi-ProbCut cascade fit ------------------
+                Some(spec) => {
+                    let cascade = probcut_fit::parse_mpc_cascade(spec)?;
+                    let res = probcut_fit::run_mpc_fit(
+                        &cascade,
+                        &src,
+                        samples,
+                        eval_weights.as_deref(),
+                        &output,
+                    )?;
+                    println!(
+                        "probcut-fit mpc-cascade={spec} source={source} \
+                         samples<={samples} seed={seed} eval={eval_kind} \
+                         T(prod)=1.0/1.4 cells={} output={}",
+                        res.cells.len(),
+                        output.display()
+                    );
+                    println!("  phase    h   d        a          b      sigma       R2      n");
+                    for c in &res.cells {
+                        let ph = match c.phase {
+                            logistello_search::DiscPhase::Lt36 => "<36 ",
+                            logistello_search::DiscPhase::Ge36 => ">=36",
+                        };
+                        println!(
+                            "  {ph}  {:>3} {:>3}  {:>9.5} {:>9.5} {:>9.5} {:>8.5} {:>6}",
+                            c.h, c.d, c.fit.a, c.fit.b, c.fit.sigma, c.fit.r2, c.fit.n
+                        );
+                    }
+                }
+                // ---- Phase 5: single-pair fit (unchanged) ----------------
+                None => {
+                    let (d, h) = parse_pair(&single_pair)?;
+                    let res = probcut_fit::run_fit(
+                        d,
+                        h,
+                        &src,
+                        samples,
+                        eval_weights.as_deref(),
+                        probcut_t,
+                        &output,
+                    )?;
+                    println!(
+                        "probcut-fit single-pair={d}:{h} source={source} \
+                         samples<={samples} seed={seed} eval={eval_kind} \
+                         T={probcut_t} output={}",
+                        output.display()
+                    );
+                    for (name, ph) in [("phase<36", res.lt36), ("phase>=36", res.ge36)] {
+                        println!(
+                            "  {name}: a={:.6} b={:.6} sigma={:.6} R2={:.6} n={}",
+                            ph.a, ph.b, ph.sigma, ph.r2, ph.n
+                        );
+                    }
+                }
             }
         }
         Command::MatchReplay => {
