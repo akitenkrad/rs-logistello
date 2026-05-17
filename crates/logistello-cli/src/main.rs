@@ -277,7 +277,19 @@ enum Command {
     /// Replay a recorded match (e.g. Murakami 1997) (Phase 9).
     MatchReplay,
     /// Estimate ELO versus Edax at various levels (Phase 9).
-    EloVsEdax,
+    ///
+    /// The external Edax engine is the gitignored local install produced
+    /// by `scripts/setup_edax.sh` (see `EDAX_SETUP.md`); Phase 9a wired
+    /// the binary + GTP driver, Phase 9b implements the measurement.
+    EloVsEdax {
+        /// Path to the Edax binary. Defaults to the gitignored
+        /// `.edax/edax` install (`EdaxConfig::DEFAULT_EDAX_PATH`).
+        #[arg(long, default_value = logistello_cli::edax::EdaxConfig::DEFAULT_EDAX_PATH)]
+        edax_path: PathBuf,
+        /// Edax fixed search strength (`edax -level N`).
+        #[arg(long, default_value_t = logistello_cli::edax::EdaxConfig::DEFAULT_LEVEL)]
+        edax_level: u32,
+    },
     /// Learn the opening book via self-play + Negamax back-propagation +
     /// drawishness (Phase 8; design doc §4.3.7 / Buro 1999). Writes the
     /// explicit little-endian `OPB1` book (see `BOOK_FORMAT.md`).
@@ -997,8 +1009,22 @@ fn main() -> Result<()> {
         Command::MatchReplay => {
             println!("match-replay: not yet implemented (Phase 9)");
         }
-        Command::EloVsEdax => {
-            println!("elo-vs-edax: not yet implemented (Phase 9)");
+        Command::EloVsEdax {
+            edax_path,
+            edax_level,
+        } => {
+            // Phase 9a wired the Edax driver; the measurement itself is
+            // Phase 9b. Report the resolved config so the wiring is
+            // verifiable from the CLI today.
+            let cfg = logistello_cli::edax::EdaxConfig::new(&edax_path, edax_level);
+            println!(
+                "elo-vs-edax: not yet implemented (Phase 9b). Edax path = {} \
+                 (exists = {}), level = {}, protocol = {:?}.",
+                edax_path.display(),
+                cfg.is_available(),
+                edax_level,
+                logistello_cli::edax::EDAX_PROTOCOL,
+            );
         }
         Command::LearnBook {
             num_games,

@@ -112,6 +112,23 @@ are scaffolded as stubs and will be filled in per implementation phase;
 `wthor-extract` is intentionally delegated to the Rust `extract` subcommand
 (Rust owns the B4 canonicalisation).
 
+### Edax external engine (optional; Phase 9)
+
+Edax v4.6 is the fixed-strength external opponent / non-playing oracle. It is
+a platform binary plus multi-MB evaluation weights and is therefore **never
+committed** (`.edax/` is gitignored). To build it and fetch the weights
+locally:
+
+```bash
+bash scripts/setup_edax.sh   # builds Edax v4.6 + fetches eval.dat into .edax/
+```
+
+The script is idempotent and self-contained; full reproducible steps,
+the macOS portability patch, and the GTP driver protocol are documented in
+[`EDAX_SETUP.md`](EDAX_SETUP.md). Without `.edax/`, the Edax integration
+test (`cargo test --test edax_smoke_test`) skips and passes, so the build
+stays green on machines without Edax.
+
 ## Status
 
 Phases 0-4b are wired end-to-end: `perft`, full game `play` (basic and

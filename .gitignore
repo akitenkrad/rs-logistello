@@ -7,3 +7,6 @@ __pycache__/
 *.pyc
 .DS_Store
 **/*.rs.bk
+# Edax external engine: platform binary + multi-MB eval weights (Phase 9a).
+# Regenerate locally via scripts/setup_edax.sh (see EDAX_SETUP.md). Never committed.
+/.edax/

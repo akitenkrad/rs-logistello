@@ -60,6 +60,10 @@ path = "../../tests/glem_interop_test.rs"
 name = "book_test"
 path = "../../tests/book_test.rs"
 
+[[test]]
+name = "edax_smoke_test"
+path = "../../tests/edax_smoke_test.rs"
+
 [dependencies]
 clap.workspace = true
 anyhow.workspace = true

@@ -17,7 +17,12 @@
 //!   Phase 7). Owns the base-literal extraction (mirrors `extract`'s "Rust
 //!   owns canonicalisation") and emits the documented `GLX1` columnar
 //!   binary the Python `train-glem` tool consumes.
+//! - [`edax`] — shared Edax v4.6 external-engine configuration (design doc
+//!   §4.5 B5; Phase 9a). The single place that knows how to drive the
+//!   locally built, gitignored `.edax/edax` binary; consumed by Phase 9b's
+//!   `elo-vs-edax`.
 
+pub mod edax;
 pub mod extract;
 pub mod glem_extract;
 pub mod probcut_fit;
