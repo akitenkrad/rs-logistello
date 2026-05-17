@@ -56,6 +56,10 @@ path = "../../tests/eval_interop_test.rs"
 name = "glem_interop_test"
 path = "../../tests/glem_interop_test.rs"
 
+[[test]]
+name = "book_test"
+path = "../../tests/book_test.rs"
+
 [dependencies]
 clap.workspace = true
 anyhow.workspace = true
@@ -74,6 +78,7 @@ othello-engine.workspace = true
 logistello-core.workspace = true
 logistello-eval.workspace = true
 logistello-search.workspace = true
+logistello-book.workspace = true
 othello-core.workspace = true
 othello-engine.workspace = true
 othello-player.workspace = true

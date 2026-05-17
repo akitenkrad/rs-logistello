@@ -9,5 +9,9 @@ description = "Logistello reproduction: opening-book learning and drawishness ev
 
 [dependencies]
 othello-core.workspace = true
+logistello-core.workspace = true
+logistello-eval.workspace = true
 logistello-search.workspace = true
 othello-engine.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true

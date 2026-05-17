@@ -14,6 +14,7 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
+use logistello_book::{BookConfig, OpeningBook, learn_book};
 use logistello_core::Zobrist;
 use logistello_core::perft::perft_standard;
 use logistello_eval::{
@@ -104,6 +105,14 @@ enum Command {
         /// Required for a meaningful `--mpc` run.
         #[arg(long)]
         mpc_params: Option<PathBuf>,
+        /// Optional learned opening book (`OPB1`, a `learn-book` output;
+        /// Phase 8, design doc §4.3.7). When given, the `engine` player
+        /// consults the book first: if the current position is booked (and
+        /// the booked move is legal) it plays the booked move instead of
+        /// searching; once play leaves the booked opening it falls back to
+        /// the normal search (composes with every other flag).
+        #[arg(long)]
+        book: Option<PathBuf>,
     },
     /// Benchmark the Phase 2 search from the standard opening using the
     /// trivial disc-difference evaluator. `--probcut` / `--mpc` run the same
@@ -269,8 +278,40 @@ enum Command {
     MatchReplay,
     /// Estimate ELO versus Edax at various levels (Phase 9).
     EloVsEdax,
-    /// Learn the opening book via self-play (Phase 8).
-    LearnBook,
+    /// Learn the opening book via self-play + Negamax back-propagation +
+    /// drawishness (Phase 8; design doc §4.3.7 / Buro 1999). Writes the
+    /// explicit little-endian `OPB1` book (see `BOOK_FORMAT.md`).
+    /// Deterministic for a fixed `--seed`.
+    LearnBook {
+        /// Number of self-play games (design doc §5.1: 10000).
+        #[arg(long, default_value_t = 1000)]
+        num_games: u32,
+        /// Per-move self-play search depth (design doc §5.1: 24; §6
+        /// `--book-depth-values {12,18,24,30}`).
+        #[arg(long, default_value_t = 24)]
+        depth: u32,
+        /// Drawishness blend `λ ∈ [0,0.5]` (design doc §5.1: 0.3; §6 range
+        /// `0.0..0.5`). Clamped into range.
+        #[arg(long, default_value_t = 0.3)]
+        drawishness: f64,
+        /// RNG seed for the (deterministic) exploration policy.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Cap on the parent ply still booked (opening-only book bound).
+        #[arg(long, default_value_t = 20)]
+        max_book_plies: u32,
+        /// Empties floor below which positions are not booked (keeps the
+        /// book clear of the Phase-3 exact endgame).
+        #[arg(long, default_value_t = 30)]
+        book_endgame_empties: u32,
+        /// Optional `LGW1` learned-weight file: self-play with the Phase 4
+        /// `PatternEval` instead of the Phase 3 `BasicEval`.
+        #[arg(long)]
+        eval_weights: Option<PathBuf>,
+        /// Output `OPB1` book path.
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Run a parameter sweep (Phase 10).
     Sweep,
     /// Verify search-tree size against known Othello perft values (Phase 1).
@@ -293,6 +334,38 @@ fn fmt_move(m: Move) -> String {
     }
 }
 
+/// A `LogistelloPlayer` with an optional Phase-8 opening book consulted
+/// first (design doc §4.3.7). If the current position is booked and the
+/// booked move is currently legal, the booked move is played without
+/// searching; once play leaves the booked opening, the wrapped engine
+/// searches normally. The book is opening-only (bounded by plies/empties at
+/// learn time, re-checked by `OpeningBook::probe`), so it can never override
+/// the Phase-3 exact endgame.
+struct BookedEngine {
+    inner: LogistelloPlayer,
+    book: Option<OpeningBook>,
+}
+
+impl Player for BookedEngine {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn color(&self) -> Color {
+        self.inner.color()
+    }
+    fn select_move(&mut self, state: &GameState) -> Result<Move, othello_player::PlayerError> {
+        if let Some(b) = &self.book
+            && let Some(m) = b.probe(state)
+        {
+            return Ok(m);
+        }
+        self.inner.select_move(state)
+    }
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+}
+
 /// A `play`-CLI player: one concrete variant per `--black` / `--white`
 /// kind. `GameEngine::run` is generic over `Sized` players, so we dispatch
 /// through this enum instead of a `Box<dyn Player>` (trait objects are
@@ -301,7 +374,7 @@ enum CliPlayer {
     // Every variant is boxed so the enum stays pointer-sized regardless of
     // the (large) `LogistelloPlayer`, which owns a transposition table
     // (clippy::large_enum_variant).
-    Engine(Box<LogistelloPlayer>),
+    Engine(Box<BookedEngine>),
     Random(Box<RandomPlayer>),
     Greedy(Box<GreedyPlayer>),
 }
@@ -362,6 +435,7 @@ fn make_player(
     cfg: &EngineConfig,
     seed: u64,
     leaf: &LeafChoice<'_>,
+    book: Option<&OpeningBook>,
 ) -> Result<CliPlayer> {
     match kind {
         "engine" => {
@@ -374,7 +448,10 @@ fn make_player(
                 }
                 LeafChoice::Basic => LogistelloPlayer::new(color, cfg.clone()),
             };
-            Ok(CliPlayer::Engine(Box::new(p)))
+            Ok(CliPlayer::Engine(Box::new(BookedEngine {
+                inner: p,
+                book: book.cloned(),
+            })))
         }
         "random" => Ok(CliPlayer::Random(Box::new(RandomPlayer::with_seed(
             color, seed,
@@ -536,6 +613,7 @@ fn main() -> Result<()> {
             probcut_params,
             mpc,
             mpc_params,
+            book,
         } => {
             let pc = build_probcut(probcut, no_probcut, probcut_t, probcut_params.as_ref())?;
             let mpc_cfg = build_multi_probcut(mpc, mpc_params.as_ref())?;
@@ -567,8 +645,29 @@ fn main() -> Result<()> {
                 (Some(p), None) => LeafChoice::Pattern(p),
                 (None, None) => LeafChoice::Basic,
             };
-            let mut black_player = make_player(&black, Color::Black, &cfg, seed, &leaf)?;
-            let mut white_player = make_player(&white, Color::White, &cfg, seed, &leaf)?;
+            let book_loaded = match &book {
+                Some(path) => Some(
+                    OpeningBook::load(path)
+                        .map_err(|e| anyhow::anyhow!("load book {}: {e}", path.display()))?,
+                ),
+                None => None,
+            };
+            let mut black_player = make_player(
+                &black,
+                Color::Black,
+                &cfg,
+                seed,
+                &leaf,
+                book_loaded.as_ref(),
+            )?;
+            let mut white_player = make_player(
+                &white,
+                Color::White,
+                &cfg,
+                seed,
+                &leaf,
+                book_loaded.as_ref(),
+            )?;
 
             let mut engine = GameEngine::new(GameEngineConfig::standard())?;
             let result = engine
@@ -607,10 +706,14 @@ fn main() -> Result<()> {
             } else {
                 "off".to_string()
             };
+            let book_kind = match (&book, &book_loaded) {
+                (Some(p), Some(b)) => format!("on({}, {} pos)", p.display(), b.len()),
+                _ => "off".to_string(),
+            };
             println!(
                 "play black={black} white={white} depth={depth} \
                  endgame_empties={endgame_empties} seed={seed} eval={eval_kind} \
-                 probcut={pc_kind} mpc={mpc_kind}"
+                 probcut={pc_kind} mpc={mpc_kind} book={book_kind}"
             );
             println!("moves: {}", moves.join(" "));
             println!(
@@ -897,8 +1000,57 @@ fn main() -> Result<()> {
         Command::EloVsEdax => {
             println!("elo-vs-edax: not yet implemented (Phase 9)");
         }
-        Command::LearnBook => {
-            println!("learn-book: not yet implemented (Phase 8)");
+        Command::LearnBook {
+            num_games,
+            depth,
+            drawishness,
+            seed,
+            max_book_plies,
+            book_endgame_empties,
+            eval_weights,
+            output,
+        } => {
+            let cfg = BookConfig {
+                num_games,
+                depth_limit: depth,
+                drawishness,
+                seed,
+                max_book_plies,
+                endgame_empties: book_endgame_empties,
+            };
+            let book = match &eval_weights {
+                Some(path) => {
+                    let w = EvalWeights::load(path)
+                        .map_err(|e| anyhow::anyhow!("load {}: {e}", path.display()))?;
+                    learn_book(&logistello_eval::PatternEval::new(w), &cfg)
+                }
+                None => learn_book(&logistello_eval::BasicEval::default(), &cfg),
+            };
+            book.save(&output)
+                .map_err(|e| anyhow::anyhow!("save {}: {e}", output.display()))?;
+
+            let eval_kind = match &eval_weights {
+                Some(p) => format!("pattern({})", p.display()),
+                None => "basic".to_string(),
+            };
+            let start = GameState::standard_8x8();
+            let root_best = book
+                .get(&start)
+                .map(|e| fmt_move(e.best_move))
+                .unwrap_or_else(|| "<none>".to_string());
+            println!(
+                "learn-book num_games={num_games} depth={depth} \
+                 drawishness={drawishness} seed={seed} \
+                 max_book_plies={max_book_plies} \
+                 book_endgame_empties={book_endgame_empties} eval={eval_kind} \
+                 output={}",
+                output.display()
+            );
+            println!(
+                "book size={} distinct_positions={} root_best_move={root_best}",
+                book.to_bytes().len(),
+                book.len()
+            );
         }
         Command::Sweep => {
             println!("sweep: not yet implemented (Phase 10)");
