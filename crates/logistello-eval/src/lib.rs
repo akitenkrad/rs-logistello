@@ -15,7 +15,11 @@
 //!   [`EvalWeights`] container / serialization contract (B4).
 //! - [`pattern_eval`] — [`PatternEval`], the pattern/regression
 //!   [`LeafEvaluator`] (design doc §4.3.3).
-//! - [`glem`]    — GLEM basic-feature → conjunction expansion (Phase 7).
+//! - [`glem`]    — GLEM (Generalized Linear Evaluation Model): declarative
+//!   base-literal families, conjunction model, the `GLM1` cross-language
+//!   model file, and [`GlemEval`] (design doc §4.3.6 / Phase 7). Rust owns
+//!   the base-literal extraction (mirrors the Phase-4b "Rust owns
+//!   canonicalisation" decision); Python only enumerates/fits/prunes.
 
 pub mod eval_trait;
 pub mod glem;
@@ -25,6 +29,10 @@ pub mod stage;
 pub mod weights;
 
 pub use eval_trait::{BasicEval, DiscDiffEval, LeafEvaluator};
+pub use glem::{
+    BaseFamily, BaseFeatureSpec, Conjunction, GLEM_MAGIC, GLEM_VERSION, GlemError, GlemEval,
+    GlemModel, SpecParseError,
+};
 pub use pattern::{
     CONST_FEATURE, FEATURES, FeatureDef, N_FEATURES, PatternType, feature_key, feature_keys,
     feature_keys_state,

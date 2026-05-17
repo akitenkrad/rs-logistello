@@ -4,6 +4,7 @@ Usage:
     logistello-tools wthor-extract [...]
     logistello-tools train-eval [...]
     logistello-tools train-glem [...]
+    logistello-tools objective5 [...]
     logistello-tools visualize [...]
     logistello-tools visualize-sweep [...]
     logistello-tools show-experiment-settings [...]
@@ -33,7 +34,15 @@ def _train_eval(argv: list[str]) -> None:
 
 
 def _train_glem(argv: list[str]) -> None:
-    print("train-glem: not yet implemented (Phase 7)")
+    from logistello_tools.train_glem import main as run_main
+
+    run_main(argv)
+
+
+def _objective5(argv: list[str]) -> None:
+    from logistello_tools.objective5 import main as run_main
+
+    run_main(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -55,6 +64,11 @@ def main(argv: list[str] | None = None) -> None:
     subparsers.add_parser(
         "train-glem",
         help="GLEM 特徴量自動生成 + 学習 (Phase 7)",
+        add_help=False,
+    )
+    subparsers.add_parser(
+        "objective5",
+        help="Objective-5: GLEM 自動特徴量 vs 手動 PatternEval 比較 (Phase 7)",
         add_help=False,
     )
     subparsers.add_parser("visualize", help="単一実行結果の可視化", add_help=False)
@@ -82,6 +96,8 @@ def main(argv: list[str] | None = None) -> None:
         _train_eval(rest)
     elif command == "train-glem":
         _train_glem(rest)
+    elif command == "objective5":
+        _objective5(rest)
     elif command == "visualize":
         from logistello_tools.visualize import main as run_main
         run_main(rest)

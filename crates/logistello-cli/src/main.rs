@@ -5,6 +5,7 @@
 //! returns success.
 
 use logistello_cli::extract;
+use logistello_cli::glem_extract;
 use logistello_cli::probcut_fit;
 
 use std::path::PathBuf;
@@ -15,7 +16,9 @@ use clap::{Parser, Subcommand};
 
 use logistello_core::Zobrist;
 use logistello_core::perft::perft_standard;
-use logistello_eval::{DiscDiffEval, EvalWeights};
+use logistello_eval::{
+    BaseFeatureSpec, DiscDiffEval, EvalWeights, GlemEval, GlemModel, LeafEvaluator,
+};
 use logistello_search::alphabeta::{INF, SearchConfig, SearchContext, negascout};
 use logistello_search::killer::KillerTable;
 use logistello_search::tt::TranspositionTable;
@@ -66,6 +69,14 @@ enum Command {
         /// the Phase 3 `BasicEval` (design doc §4.3.3 / §4.4 B1-B4).
         #[arg(long)]
         eval_weights: Option<PathBuf>,
+        /// Optional `GLM1` GLEM model file (Phase 7, design doc §4.3.6).
+        /// When given, the `engine` player uses `GlemEval` (auto-generated
+        /// conjunction features) as its midgame leaf evaluator instead of
+        /// `PatternEval` / `BasicEval`. Mutually exclusive with
+        /// `--eval-weights` (PatternEval vs GlemEval are alternative leaf
+        /// evaluators); composes with `--probcut` / `--mpc`.
+        #[arg(long, conflicts_with = "eval_weights")]
+        glem_model: Option<PathBuf>,
         /// Enable single ProbCut for the `engine` player (design doc
         /// §4.3.4 / §4.5 B7). Off by default. Use `--no-probcut` to force
         /// it off explicitly.
@@ -139,6 +150,12 @@ enum Command {
         /// Seed for the `--from-plies` random walk.
         #[arg(long, default_value_t = 42)]
         seed: u64,
+        /// Optional `GLM1` GLEM model (Phase 7, design doc §4.3.6). When
+        /// given, the benchmark uses `GlemEval` as the leaf evaluator
+        /// instead of the trivial disc-difference one (composes with
+        /// `--probcut` / `--mpc`).
+        #[arg(long)]
+        glem_model: Option<PathBuf>,
     },
     /// Run self-play games for data generation (Phase 4).
     Selfplay,
@@ -164,6 +181,37 @@ enum Command {
         #[arg(long)]
         max_empties_skip: Option<u32>,
         /// Output `PEX1` file.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Extract GLEM base-literal training positions (Phase 7; design doc
+    /// §4.3.6). Rust owns the base-literal extraction (mirrors Phase-4b
+    /// `extract`'s "Rust owns canonicalisation"); emits the `GLX1` columnar
+    /// binary the Python `train-glem` tool consumes (see GLEM_FORMAT.md).
+    GlemExtract {
+        /// Comma list of base-feature families
+        /// (`cell64`,`mobility`,`corner`); order = the spec id recorded in
+        /// `GLX1` / `GLM1`.
+        #[arg(long, default_value = "cell64,mobility,corner")]
+        base_features: String,
+        /// Corpus: `selfplay` (RandomPlayer self-play, seeded, no external
+        /// data) or `wthor` (real `.wtb` expert games).
+        #[arg(long, default_value = "selfplay")]
+        source: String,
+        /// Directory containing `.wtb` files (required for `--source wthor`).
+        #[arg(long)]
+        wthor_dir: Option<PathBuf>,
+        /// Number of self-play games (`--source selfplay`) / max WTHOR games.
+        #[arg(long, default_value_t = 2000)]
+        games: usize,
+        /// Self-play RNG seed (deterministic).
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Skip positions with more than this many empty squares (drop the
+        /// very opening). Omit to keep every non-terminal position.
+        #[arg(long)]
+        max_empties_skip: Option<u32>,
+        /// Output `GLX1` file.
         #[arg(long)]
         output: PathBuf,
     },
@@ -292,23 +340,39 @@ impl Player for CliPlayer {
     }
 }
 
+/// Which midgame leaf evaluator the `engine` player should use. `Basic` is
+/// the Phase 3 default; `Pattern` is the Phase 4 `PatternEval`
+/// (`--eval-weights`); `Glem` is the Phase 7 `GlemEval` (`--glem-model`).
+/// `Pattern` and `Glem` are mutually exclusive (auto vs manual features).
+#[derive(Clone)]
+enum LeafChoice<'a> {
+    Basic,
+    Pattern(&'a logistello_eval::PatternEval),
+    Glem(&'a GlemEval),
+}
+
 /// Builds a [`CliPlayer`] of the requested kind for `color`.
 ///
-/// `engine` -> [`LogistelloPlayer`] with `cfg` (using the learned
-/// `PatternEval` when `learned` is supplied, else `BasicEval`);
-/// `random` -> seeded [`RandomPlayer`]; `greedy` -> [`GreedyPlayer`].
+/// `engine` -> [`LogistelloPlayer`] with `cfg` (using `PatternEval` /
+/// `GlemEval` per `leaf`, else `BasicEval`); `random` -> seeded
+/// [`RandomPlayer`]; `greedy` -> [`GreedyPlayer`].
 fn make_player(
     kind: &str,
     color: Color,
     cfg: &EngineConfig,
     seed: u64,
-    learned: Option<&logistello_eval::PatternEval>,
+    leaf: &LeafChoice<'_>,
 ) -> Result<CliPlayer> {
     match kind {
         "engine" => {
-            let p = match learned {
-                Some(pe) => LogistelloPlayer::with_pattern(color, cfg.clone(), pe.clone()),
-                None => LogistelloPlayer::new(color, cfg.clone()),
+            let p = match leaf {
+                LeafChoice::Pattern(pe) => {
+                    LogistelloPlayer::with_pattern(color, cfg.clone(), (*pe).clone())
+                }
+                LeafChoice::Glem(ge) => {
+                    LogistelloPlayer::with_glem(color, cfg.clone(), (*ge).clone())
+                }
+                LeafChoice::Basic => LogistelloPlayer::new(color, cfg.clone()),
             };
             Ok(CliPlayer::Engine(Box::new(p)))
         }
@@ -424,11 +488,12 @@ fn walk_position(plies: usize, seed: u64) -> GameState {
     s
 }
 
-/// One fixed-depth NegaScout from `root` with the given ProbCut + MPC
-/// config, returning `(value, nodes, elapsed_secs)`.
-fn bench_one(
+/// One fixed-depth NegaScout from `root` with the given evaluator and
+/// ProbCut + MPC config, returning `(value, nodes, elapsed_secs)`.
+fn bench_one_with<E: LeafEvaluator>(
     root: &GameState,
     depth: u32,
+    eval: &E,
     pc: ProbCutConfig,
     mpc: MultiProbCutConfig,
 ) -> (i32, u64, f64) {
@@ -441,7 +506,7 @@ fn bench_one(
         ..SearchConfig::default()
     };
     let mut ctx = SearchContext {
-        evaluator: &DiscDiffEval,
+        evaluator: eval,
         tt: &mut tt,
         killers: &mut killers,
         zobrist: &z,
@@ -464,6 +529,7 @@ fn main() -> Result<()> {
             endgame_empties,
             seed,
             eval_weights,
+            glem_model,
             probcut,
             no_probcut,
             probcut_t,
@@ -488,8 +554,21 @@ fn main() -> Result<()> {
                 }
                 None => None,
             };
-            let mut black_player = make_player(&black, Color::Black, &cfg, seed, learned.as_ref())?;
-            let mut white_player = make_player(&white, Color::White, &cfg, seed, learned.as_ref())?;
+            let glem = match &glem_model {
+                Some(path) => {
+                    let m = GlemModel::load(path)
+                        .map_err(|e| anyhow::anyhow!("load {}: {e}", path.display()))?;
+                    Some(GlemEval::new(m))
+                }
+                None => None,
+            };
+            let leaf = match (learned.as_ref(), glem.as_ref()) {
+                (_, Some(g)) => LeafChoice::Glem(g),
+                (Some(p), None) => LeafChoice::Pattern(p),
+                (None, None) => LeafChoice::Basic,
+            };
+            let mut black_player = make_player(&black, Color::Black, &cfg, seed, &leaf)?;
+            let mut white_player = make_player(&white, Color::White, &cfg, seed, &leaf)?;
 
             let mut engine = GameEngine::new(GameEngineConfig::standard())?;
             let result = engine
@@ -508,9 +587,10 @@ fn main() -> Result<()> {
                 Some(Color::White) => "white",
                 None => "draw",
             };
-            let eval_kind = match &eval_weights {
-                Some(p) => format!("pattern({})", p.display()),
-                None => "basic".to_string(),
+            let eval_kind = match (&glem_model, &eval_weights) {
+                (Some(g), _) => format!("glem({})", g.display()),
+                (None, Some(p)) => format!("pattern({})", p.display()),
+                (None, None) => "basic".to_string(),
             };
             let pc_kind = if pc.enabled {
                 format!("on(T={},d={},h={})", pc.t, pc.d, pc.h)
@@ -549,6 +629,7 @@ fn main() -> Result<()> {
             speedup,
             from_plies,
             seed,
+            glem_model,
         } => {
             let root = walk_position(from_plies, seed);
             let nps = |nodes: u64, secs: f64| -> u64 {
@@ -556,6 +637,27 @@ fn main() -> Result<()> {
                     (nodes as f64 / secs) as u64
                 } else {
                     0
+                }
+            };
+            // GLEM leaf evaluator selectable; default = trivial disc-diff.
+            let glem_eval = match &glem_model {
+                Some(path) => {
+                    let m = GlemModel::load(path)
+                        .map_err(|e| anyhow::anyhow!("load {}: {e}", path.display()))?;
+                    Some(GlemEval::new(m))
+                }
+                None => None,
+            };
+            // Single closure so every call site (full / single / mpc) uses
+            // the same chosen evaluator without duplicating the match.
+            let bench_one = |root: &GameState,
+                             depth: u32,
+                             pc: ProbCutConfig,
+                             mc: MultiProbCutConfig|
+             -> (i32, u64, f64) {
+                match &glem_eval {
+                    Some(g) => bench_one_with(root, depth, g, pc, mc),
+                    None => bench_one_with(root, depth, &DiscDiffEval, pc, mc),
                 }
             };
 
@@ -628,10 +730,14 @@ fn main() -> Result<()> {
                 let (value, nodes, secs) = bench_one(&root, depth, pc, mc.clone());
                 let pc_kind = if pc.enabled { "on" } else { "off" };
                 let mpc_kind = if mc.enabled { "on" } else { "off" };
+                let eval_kind = match &glem_model {
+                    Some(p) => format!("glem({})", p.display()),
+                    None => "discdiff".to_string(),
+                };
                 println!(
                     "bench-search depth={depth} from_plies={from_plies} \
-                     probcut={pc_kind} mpc={mpc_kind} value={value} \
-                     nodes={nodes} time={secs:.3}s nps={}",
+                     eval={eval_kind} probcut={pc_kind} mpc={mpc_kind} \
+                     value={value} nodes={nodes} time={secs:.3}s nps={}",
                     nps(nodes, secs)
                 );
             }
@@ -661,6 +767,37 @@ fn main() -> Result<()> {
             println!(
                 "extract source={source} games<={games} \
                  records={} output={}",
+                records.len(),
+                output.display()
+            );
+        }
+        Command::GlemExtract {
+            base_features,
+            source,
+            wthor_dir,
+            games,
+            seed,
+            max_empties_skip,
+            output,
+        } => {
+            let spec =
+                BaseFeatureSpec::parse(&base_features).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let records = match source.as_str() {
+                "selfplay" => glem_extract::extract_selfplay(&spec, games, seed, max_empties_skip)?,
+                "wthor" => {
+                    let dir = wthor_dir.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("--wthor-dir is required for --source wthor")
+                    })?;
+                    glem_extract::extract_wthor(&spec, dir, Some(games), max_empties_skip)?
+                }
+                other => bail!("unknown --source '{other}' (want selfplay|wthor)"),
+            };
+            glem_extract::write_glx1(&output, &spec, &records)?;
+            println!(
+                "glem-extract base-features={} source={source} \
+                 games<={games} n_literals={} records={} output={}",
+                spec.to_spec_string(),
+                spec.n_literals(),
                 records.len(),
                 output.display()
             );

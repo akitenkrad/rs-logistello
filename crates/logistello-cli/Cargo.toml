@@ -52,6 +52,10 @@ path = "../../tests/extract_test.rs"
 name = "eval_interop_test"
 path = "../../tests/eval_interop_test.rs"
 
+[[test]]
+name = "glem_interop_test"
+path = "../../tests/glem_interop_test.rs"
+
 [dependencies]
 clap.workspace = true
 anyhow.workspace = true

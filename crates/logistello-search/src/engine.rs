@@ -16,7 +16,7 @@
 //! evaluator / config.
 
 use logistello_core::Zobrist;
-use logistello_eval::{BasicEval, LeafEvaluator, PatternEval};
+use logistello_eval::{BasicEval, GlemEval, LeafEvaluator, PatternEval};
 use othello_core::{Color, GameState, Move};
 use othello_player::{Player, PlayerError};
 
@@ -179,6 +179,10 @@ pub enum EngineEval {
     /// Phase 4 learned pattern/regression evaluator (boxed: it owns the
     /// large `EvalWeights` table — keeps the enum small).
     Pattern(Box<PatternEval>),
+    /// Phase 7 GLEM evaluator (auto-generated conjunction features; design
+    /// doc §4.3.6). Boxed: it owns the conjunction table + per-stage
+    /// weights, keeping the enum small (mirrors `Pattern`).
+    Glem(Box<GlemEval>),
 }
 
 impl LeafEvaluator for EngineEval {
@@ -187,6 +191,7 @@ impl LeafEvaluator for EngineEval {
         match self {
             EngineEval::Basic(e) => e.eval(state),
             EngineEval::Pattern(e) => e.eval(state),
+            EngineEval::Glem(e) => e.eval(state),
         }
     }
 }
@@ -234,6 +239,23 @@ impl LogistelloPlayer {
             color,
             config,
             eval: EngineEval::Pattern(Box::new(pattern)),
+            tt: TranspositionTable::new(),
+            killers: KillerTable::new(),
+            zobrist: Zobrist::new(),
+        }
+    }
+
+    /// Builds a player for `color` that uses the Phase 7 [`GlemEval`]
+    /// (auto-generated conjunction features, `GLM1` model; design doc
+    /// §4.3.6) as the midgame leaf evaluator. `GlemEval` and [`PatternEval`]
+    /// are alternative leaf evaluators (auto vs manual features; Objective-5).
+    #[must_use]
+    pub fn with_glem(color: Color, config: EngineConfig, glem: GlemEval) -> Self {
+        Self {
+            name: "Logistello".to_string(),
+            color,
+            config,
+            eval: EngineEval::Glem(Box::new(glem)),
             tt: TranspositionTable::new(),
             killers: KillerTable::new(),
             zobrist: Zobrist::new(),

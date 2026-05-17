@@ -151,6 +151,46 @@ def fit_stage_sklearn(
     return np.asarray(model.coef_, dtype=np.float64).ravel()
 
 
+def fit_stage(x: sp.csr_matrix, y: np.ndarray, method: str) -> np.ndarray:
+    """Dispatches one stage's least-squares fit by ``method``.
+
+    ``gd`` = the faithful B3 GD-300 + rare-config muting (default);
+    ``ridge`` / ``sgd`` = the scikit-learn §7 alternatives. Returns weights
+    in **disc units** (NOT ×128). Shared by Phase-4b ``train`` *and* the
+    Phase-7 GLEM trainer so the B3 numerics are identical (a single code
+    path — design doc §4.4 B3 / §4.3.6 B3 substitution).
+    """
+    if method == "gd":
+        return fit_stage_gd(x, y)
+    return fit_stage_sklearn(x, y, method)
+
+
+def fit_all_stages(
+    design_for_stage,
+    method: str = "gd",
+) -> list[np.ndarray]:
+    """Fits all 13 stages with adjacent-5 smoothing, returning per-stage
+    weight vectors **in disc units**.
+
+    ``design_for_stage(t) -> (X, y) | None`` must return the (already
+    smoothing-windowed) sparse design and target for stage ``t`` over a
+    *fixed* column space, or ``None`` when that stage's window is empty.
+    The adjacent-5 window itself (``{t-2..t+2} ∩ [0,12]``) is the caller's
+    responsibility (both ``train`` here and the GLEM trainer build the
+    window mask identically — same ``SMOOTH``). Centralising the per-stage
+    fit keeps the B3 GD/muting numerics in one place.
+    """
+    out: list[np.ndarray] = []
+    for t in range(N_STAGES):
+        d = design_for_stage(t)
+        if d is None:
+            out.append(None)  # type: ignore[arg-type]
+            continue
+        x, y = d
+        out.append(fit_stage(x, y, method))
+    return out
+
+
 def train(positions: str, method: str = "gd") -> EvalWeights:
     """Trains all 13 stages from a PEX1 corpus and returns ``EvalWeights``.
 

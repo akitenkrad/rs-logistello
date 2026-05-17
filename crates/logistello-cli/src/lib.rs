@@ -13,6 +13,11 @@
 //!   (design doc §4.3.4 / §4.5 B7; Phase 5). Generates a sample corpus,
 //!   measures `v_d`/`v_h`, fits OLS per disc-count phase, and writes a
 //!   [`logistello_search::ProbCutConfig`]-compatible JSON file.
+//! - [`glem_extract`] — GLEM base-literal extraction (design doc §4.3.6;
+//!   Phase 7). Owns the base-literal extraction (mirrors `extract`'s "Rust
+//!   owns canonicalisation") and emits the documented `GLX1` columnar
+//!   binary the Python `train-glem` tool consumes.
 
 pub mod extract;
+pub mod glem_extract;
 pub mod probcut_fit;
