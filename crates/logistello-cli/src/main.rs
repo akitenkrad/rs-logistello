@@ -12,6 +12,7 @@ use logistello_cli::glem_extract;
 use logistello_cli::match_replay::{self, ReplayEngine};
 use logistello_cli::probcut_fit;
 use logistello_cli::results;
+use logistello_cli::sweep;
 use logistello_cli::wthor_murakami::{self, fmt_algebraic as fmt_alg, parse_algebraic};
 
 use std::path::PathBuf;
@@ -417,8 +418,90 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Run a parameter sweep (Phase 10).
-    Sweep,
+    /// Run a §6 sensitivity-analysis parameter sweep (Phase 10; design
+    /// doc §6 / §5.1 / §4.2). Sweep **one** §6 parameter at a time (the §6
+    /// table is one row per parameter); each condition is run for `--runs`
+    /// independent seeded trials. Writes `results/<ts>/sweep_config.json`
+    /// (the resolved spec) + `metrics.csv` (one row per trial) and refreshes
+    /// `results/latest`. With no parameter flag it lists the sweepable
+    /// parameters and exits non-zero.
+    ///
+    /// Metric per parameter (see `crate::sweep`): ProbCut-T / depth-pair /
+    /// multi-stages / max-depth / TT-size / endgame-empties → search node
+    /// count (+ value/time/nps/dispatch); eval-stages → held-out eval
+    /// absolute error; GLEM order/support → generated feature count;
+    /// book-depth → learned-book position count; drawishness → self-play
+    /// score.
+    Sweep {
+        /// ProbCut confidence `T` grid min (design doc §6: 1.0..2.5).
+        #[arg(long)]
+        probcut_t_min: Option<f64>,
+        /// ProbCut `T` grid max.
+        #[arg(long)]
+        probcut_t_max: Option<f64>,
+        /// ProbCut `T` grid step (design doc §6: 0.25).
+        #[arg(long)]
+        probcut_t_step: Option<f64>,
+        /// ProbCut depth-pair candidates `d:h,...` (design doc §6:
+        /// `1:5,3:7,5:9,3:9,5:11`).
+        #[arg(long)]
+        probcut_depth_pairs_values: Option<String>,
+        /// Multi-ProbCut cascade-stage candidates (design doc §6: `1..5`).
+        #[arg(long)]
+        multi_stages_values: Option<String>,
+        /// Evaluation-stage-count candidates (design doc §6:
+        /// `1,5,10,13,20,30`).
+        #[arg(long)]
+        eval_stages_values: Option<String>,
+        /// GLEM max-conjunction-order candidates (design doc §6: `1..4`).
+        #[arg(long)]
+        glem_max_order_values: Option<String>,
+        /// GLEM support-threshold grid min as a `log10` exponent (design
+        /// doc §6: `1e-4..1e-2` ⇒ pass `-4`).
+        #[arg(long)]
+        glem_support_min: Option<f64>,
+        /// GLEM support-threshold grid max as a `log10` exponent (`1e-2` ⇒
+        /// pass `-2`).
+        #[arg(long)]
+        glem_support_max: Option<f64>,
+        /// GLEM support-threshold `log10` step (design doc §6: 0.25).
+        #[arg(long)]
+        glem_support_step: Option<f64>,
+        /// Iterative-deepening max-depth candidates (design doc §6:
+        /// `6,8,10,12`).
+        #[arg(long)]
+        max_depth_values: Option<String>,
+        /// Transposition-table size candidates as `log2` exponents (design
+        /// doc §6: `2^20..2^26` ⇒ `20,22,24,26`).
+        #[arg(long)]
+        tt_size_values: Option<String>,
+        /// Opening-book self-play depth candidates (design doc §6:
+        /// `12,18,24,30`).
+        #[arg(long)]
+        book_depth_values: Option<String>,
+        /// Exact-endgame switch (empties) candidates (design doc §6 / B8:
+        /// `8,10,16,20,24`; default 20).
+        #[arg(long)]
+        endgame_empties_values: Option<String>,
+        /// Drawishness-weight grid min (design doc §6: 0.0..0.5).
+        #[arg(long)]
+        drawishness_min: Option<f64>,
+        /// Drawishness-weight grid max.
+        #[arg(long)]
+        drawishness_max: Option<f64>,
+        /// Drawishness-weight grid step (design doc §6: 0.1).
+        #[arg(long)]
+        drawishness_step: Option<f64>,
+        /// Independent seeded trials per condition (design doc §6: 30;
+        /// Edax-based conditions ≥50). Keep small for the demo.
+        #[arg(long, default_value_t = 30)]
+        runs: u32,
+        /// Base RNG seed; the per-trial seed is derived explicitly as
+        /// `seed + condition_index*runs + trial_index` (no wall-clock, so
+        /// `metrics.csv` is byte-identical across runs).
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+    },
     /// Verify search-tree size against known Othello perft values (Phase 1).
     Perft {
         /// Depth (plies) to enumerate from the standard starting position.
@@ -1065,6 +1148,37 @@ fn main() -> Result<()> {
                 "final score: black={} white={} winner={winner}",
                 result.black, result.white
             );
+
+            // §4.2 single-run output contract: a timestamped run dir with
+            // `config.json` (the resolved single condition) + `metrics.csv`
+            // (one summary row) so `show-experiment-settings` / `visualize`
+            // can consume a `run`. Best-effort (a results-dir failure must
+            // not fail the game itself).
+            if let Ok(run) = results::new_run_dir(std::path::Path::new("results")) {
+                let cfg = serde_json::json!({
+                    "command": "play",
+                    "black": black,
+                    "white": white,
+                    "depth": depth,
+                    "endgame_empties": endgame_empties,
+                    "seed": seed,
+                    "eval": eval_kind,
+                    "probcut": pc_kind,
+                    "mpc": mpc_kind,
+                    "book": book_kind,
+                });
+                let _ = std::fs::write(
+                    run.join("config.json"),
+                    serde_json::to_string_pretty(&cfg).unwrap_or_default(),
+                );
+                let plies = moves.len();
+                let metrics = format!(
+                    "black_score,white_score,winner,plies,seed\n{},{},{winner},{plies},{seed}\n",
+                    result.black, result.white
+                );
+                let _ = std::fs::write(run.join("metrics.csv"), metrics);
+                println!("results: {}", run.display());
+            }
         }
         Command::BenchSearch {
             depth,
@@ -1711,8 +1825,98 @@ fn main() -> Result<()> {
                 book.len()
             );
         }
-        Command::Sweep => {
-            println!("sweep: not yet implemented (Phase 10)");
+        Command::Sweep {
+            probcut_t_min,
+            probcut_t_max,
+            probcut_t_step,
+            probcut_depth_pairs_values,
+            multi_stages_values,
+            eval_stages_values,
+            glem_max_order_values,
+            glem_support_min,
+            glem_support_max,
+            glem_support_step,
+            max_depth_values,
+            tt_size_values,
+            book_depth_values,
+            endgame_empties_values,
+            drawishness_min,
+            drawishness_max,
+            drawishness_step,
+            runs,
+            seed,
+        } => {
+            // A `min[/max/step]` triple ⇒ `(min, max||min, step||1.0)`; a
+            // bare `--x-min` (no max/step) is a degenerate single-point grid
+            // (the expander returns just `[min]`).
+            let triple = |min: Option<f64>,
+                          max: Option<f64>,
+                          step: Option<f64>|
+             -> Option<(f64, f64, f64)> {
+                min.map(|lo| (lo, max.unwrap_or(lo), step.unwrap_or(1.0)))
+            };
+            let spec = sweep::SweepSpec {
+                probcut_t: triple(probcut_t_min, probcut_t_max, probcut_t_step),
+                probcut_depth_pairs_values,
+                multi_stages_values,
+                eval_stages_values,
+                glem_max_order_values,
+                glem_support: triple(glem_support_min, glem_support_max, glem_support_step),
+                max_depth_values,
+                tt_size_values,
+                book_depth_values,
+                endgame_empties_values,
+                drawishness: triple(drawishness_min, drawishness_max, drawishness_step),
+                runs,
+                seed,
+            };
+            let resolved = match spec.resolve() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("sweep: {e}");
+                    std::process::exit(2);
+                }
+            };
+            println!(
+                "sweep param={} metric={} conditions={} runs={runs} \
+                 trials={} seed={seed}",
+                resolved.axis.col(),
+                resolved.axis.metric(),
+                resolved.points.len(),
+                resolved.points.len() * runs as usize,
+            );
+            let (run_dir, rows) = sweep::run_sweep(&resolved, std::path::Path::new("results"))?;
+            println!(
+                "wrote {} ({} rows) + {}",
+                run_dir.join("metrics.csv").display(),
+                rows.len(),
+                run_dir.join("sweep_config.json").display(),
+            );
+            // A short per-condition mean of the headline metric so the run
+            // is self-describing without the Python viz.
+            use std::collections::BTreeMap;
+            let mut by_val: BTreeMap<String, (f64, u64)> = BTreeMap::new();
+            for r in &rows {
+                let m = match resolved.axis.metric() {
+                    "nodes" => r.nodes as f64,
+                    "eval_abs_err" => r.eval_abs_err,
+                    "n_features" => r.n_features as f64,
+                    "book_positions" => r.book_positions as f64,
+                    "selfplay_score" => r.selfplay_score as f64,
+                    _ => 0.0,
+                };
+                let e = by_val.entry(r.value.clone()).or_insert((0.0, 0));
+                e.0 += m;
+                e.1 += 1;
+            }
+            for (v, (sum, n)) in by_val {
+                println!(
+                    "  {}={v:<10} mean_{}={:.4} (n={n})",
+                    resolved.axis.col(),
+                    resolved.axis.metric(),
+                    sum / n.max(1) as f64
+                );
+            }
         }
         Command::Perft { depth } => {
             let nodes = perft_standard(depth);

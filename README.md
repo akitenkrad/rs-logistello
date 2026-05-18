@@ -106,11 +106,11 @@ uv run logistello-tools --help
 uv run logistello-tools train-eval --positions FILE --output FILE.lgw1
 ```
 
-`train-eval` is implemented (Phase 4b). The remaining Python tools
-(`train-glem`, `visualize`, `visualize-sweep`, `show-experiment-settings`)
-are scaffolded as stubs and will be filled in per implementation phase;
-`wthor-extract` is intentionally delegated to the Rust `extract` subcommand
-(Rust owns the B4 canonicalisation).
+`train-eval` (Phase 4b), `train-glem` (Phase 7), and the Phase 10
+visualisation tools (`visualize`, `visualize-sweep`,
+`show-experiment-settings`) are implemented; `wthor-extract` is
+intentionally delegated to the Rust `extract` subcommand (Rust owns the B4
+canonicalisation).
 
 ### Edax external engine (optional; Phase 9)
 
@@ -189,6 +189,99 @@ CSV into a timestamped `results/<YYYYMMDD_HHMMSS>/` directory with a
 > medium weights are weaker than the §5 ≥80% / historical targets — that
 > bar is for production-scale training. The full-scale commands are below.
 
+### Phase 10: sensitivity analysis (`sweep`) + visualization
+
+`sweep` runs the design-doc §6 sensitivity analysis: it expands one §6
+parameter into its grid (inclusive `min/max/step`, log-scale for GLEM
+support, or an explicit value list), runs `--runs` independent **seeded**
+trials per value, and writes the §4.2 output contract into a fresh
+`results/<YYYYMMDD_HHMMSS>/` (refreshing `results/latest`):
+
+- `sweep_config.json` — the fully resolved sweep spec.
+- `metrics.csv` — one row per trial: the swept parameter column, the
+  measured-metric columns, and the trial `seed`.
+
+Sweep **one parameter at a time** (the §6 table is one row per parameter).
+The per-trial RNG seed is derived explicitly as
+`--seed + condition_index*runs + trial_index` (never wall-clock), so
+`metrics.csv` is byte-identical across repeated invocations. The metric
+recorded per parameter (design-doc §6 "期待される主要な知見"):
+
+| parameter (`--flag`) | metric | §6-expected direction |
+|---|---|---|
+| `--probcut-t-min/max/step` (1.0–2.5/0.25) | search `nodes` | larger `T` ⇒ fewer cuts ⇒ more nodes |
+| `--probcut-depth-pairs-values d:h,…` | search `nodes` | shallower `d` ⇒ looser/cheaper probe |
+| `--multi-stages-values 1..5` | search `nodes` | `k≈3` empirical optimum |
+| `--eval-stages-values 1,5,10,13,20,30` | `eval_abs_err` | drops sharply by ≥5 stages, saturates ≥13 |
+| `--glem-max-order-values 1..4` | `n_features` | order-2 captures most; order-4 overfits |
+| `--glem-support-min/max/step` (1e-4–1e-2 log) | `n_features` | higher τ ⇒ fewer features |
+| `--max-depth-values 6,8,10,12` | search `nodes` | grows ~exponentially with depth |
+| `--tt-size-values 20,22,24,26` (=2^k) | search `nodes` | bigger TT ⇒ fewer nodes (saturates ≥2^24) |
+| `--book-depth-values 12,18,24,30` | `book_positions` | deeper ⇒ a larger / stabler book |
+| `--endgame-empties-values 8,10,16,20,24` | search `nodes` | larger ⇒ exact endgame starts earlier ⇒ more nodes |
+| `--drawishness-min/max/step` (0.0–0.5/0.1) | `selfplay_score` | `λ` shifts the self-play outcome |
+
+`sweep` with no parameter flag lists the sweepable parameters and exits
+non-zero.
+
+**Small demo (cheap; fast — safe to run anytime):**
+
+```bash
+# A tiny real sweep: 2 ProbCut-T values × 2 endgame thresholds is NOT a
+# valid single-axis sweep (one parameter per run); demo one axis at a time.
+cargo run --release -p logistello-cli -- sweep \
+    --endgame-empties-values 10,20 --runs 3 --seed 42
+
+uv run logistello-tools show-experiment-settings --results-dir results/latest
+uv run logistello-tools visualize-sweep --results-dir results/latest
+#   -> results/latest/figures/{sweep_<metric>.png, sweep_overview.png,
+#                              sweep_grid_animation.gif}
+
+# A single full game also writes the §4.2 run layout
+# (config.json + metrics.csv) consumable by visualize:
+cargo run --release -p logistello-cli -- play \
+    --black engine --white random --depth 6 --seed 42
+uv run logistello-tools visualize --results-dir results/latest
+```
+
+**Full §6 sweep (heavy; user-run — design-doc §6: 30 trials/condition,
+≥50 for Edax-based; the §5.1 example):**
+
+```bash
+# §5.1 example: ProbCut-T grid, 30 independent trials per condition.
+cargo run --release -p logistello-cli -- sweep \
+    --probcut-t-min 1.0 --probcut-t-max 2.5 --probcut-t-step 0.25 \
+    --runs 30 --seed 42
+
+# Every other §6 row, one per invocation, --runs 30:
+cargo run --release -p logistello-cli -- sweep \
+    --probcut-depth-pairs-values 1:5,3:7,5:9,3:9,5:11 --runs 30 --seed 42
+cargo run --release -p logistello-cli -- sweep \
+    --multi-stages-values 1,2,3,4,5 --runs 30 --seed 42
+cargo run --release -p logistello-cli -- sweep \
+    --eval-stages-values 1,5,10,13,20,30 --runs 30 --seed 42
+cargo run --release -p logistello-cli -- sweep \
+    --glem-max-order-values 1,2,3,4 --runs 30 --seed 42
+cargo run --release -p logistello-cli -- sweep \
+    --glem-support-min -4 --glem-support-max -2 --glem-support-step 0.25 \
+    --runs 30 --seed 42
+cargo run --release -p logistello-cli -- sweep \
+    --max-depth-values 6,8,10,12 --runs 30 --seed 42
+cargo run --release -p logistello-cli -- sweep \
+    --tt-size-values 20,22,24,26 --runs 30 --seed 42
+cargo run --release -p logistello-cli -- sweep \
+    --book-depth-values 12,18,24,30 --runs 30 --seed 42
+cargo run --release -p logistello-cli -- sweep \
+    --endgame-empties-values 8,10,16,20,24 --runs 30 --seed 42
+cargo run --release -p logistello-cli -- sweep \
+    --drawishness-min 0.0 --drawishness-max 0.5 --drawishness-step 0.1 \
+    --runs 30 --seed 42
+
+# Edax-based conditions use --runs 50 (design-doc §6 statistical-confidence
+# requirement) once an Edax-vs-engine sweep metric is wired.
+uv run logistello-tools visualize-sweep --results-dir results/latest
+```
+
 ### Phase 9 / full-scale reproduction (heavy; user-run)
 
 These reproduce the design-doc §5 targets at full scale. They are
@@ -223,15 +316,18 @@ cargo run --release -p logistello-cli -- elo-vs-edax \
 
 ## Status
 
-Phases 0-9b are wired end-to-end: `perft`, full game `play` (basic /
-learned pattern / GLEM evaluators), Phase 4b position `extract`
+Phases 0-10 are wired end-to-end: `perft`, full game `play` (basic /
+learned pattern / GLEM evaluators; also writes the §4.2 single-run
+`config.json` + `metrics.csv`), Phase 4b position `extract`
 (self-play / WTHOR) + the Python `train-eval` linear-regression pipeline
 (cross-language byte-identical `LGW1`), `probcut-fit` (single +
-Multi-ProbCut), `learn-book` (Phase 8), the Edax v4.6 integration, and
+Multi-ProbCut), `learn-book` (Phase 8), the Edax v4.6 integration,
 Phase 9b's `murakami-extract` / `match-replay` / `elo-vs-edax` /
-`eval-correlation-edax` (the design-doc §4.3.8 metrics). The remaining
-Python visualisation tools and `sweep` (Phase 10) are Phase-tagged
-placeholders.
+`eval-correlation-edax` (the design-doc §4.3.8 metrics), and Phase 10's
+§6 sensitivity-analysis `sweep` (deterministic per-`(condition, seed)`
+trials, `sweep_config.json` + `metrics.csv`) with the Python
+`visualize` / `visualize-sweep` / `show-experiment-settings` tools
+(parameter-vs-metric dependency figures + per-condition grid animation).
 
 ## References
 

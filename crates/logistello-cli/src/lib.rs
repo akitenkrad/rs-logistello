@@ -30,6 +30,9 @@
 //! - [`eval_corr`] — Pearson correlation of our eval vs Edax's (design doc
 //!   §4.3.8 `eval_correlation_edax`; Phase 9b `eval-correlation-edax`).
 //! - [`results`] — the §4.2 `results/<ts>/` + `results/latest` layout.
+//! - [`sweep`] — Phase 10 sensitivity analysis: §6 parameter-grid
+//!   expansion, deterministic per-`(condition, seed)` measurement, and the
+//!   §4.2 `sweep_config.json` + `metrics.csv` output contract.
 
 pub mod edax;
 pub mod elo;
@@ -39,4 +42,5 @@ pub mod glem_extract;
 pub mod match_replay;
 pub mod probcut_fit;
 pub mod results;
+pub mod sweep;
 pub mod wthor_murakami;
