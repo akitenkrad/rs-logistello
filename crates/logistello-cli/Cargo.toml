@@ -64,11 +64,18 @@ path = "../../tests/book_test.rs"
 name = "edax_smoke_test"
 path = "../../tests/edax_smoke_test.rs"
 
+[[test]]
+name = "murakami_replay_test"
+path = "../../tests/murakami_replay_test.rs"
+
 [dependencies]
 clap.workspace = true
 anyhow.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
 logistello-core.workspace = true
 logistello-eval.workspace = true
 logistello-search.workspace = true
@@ -89,3 +96,4 @@ othello-player.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 serde_json.workspace = true
+anyhow.workspace = true

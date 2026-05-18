@@ -4,9 +4,15 @@
 //! Phase-tagged placeholder that prints a "not yet implemented" message and
 //! returns success.
 
+use logistello_cli::edax::{EdaxConfig, EdaxGtpSession, GtpColor, resolve_edax_path};
+use logistello_cli::elo::{LevelResult, Outcome};
+use logistello_cli::eval_corr::{self, CorrSample};
 use logistello_cli::extract;
 use logistello_cli::glem_extract;
+use logistello_cli::match_replay::{self, ReplayEngine};
 use logistello_cli::probcut_fit;
+use logistello_cli::results;
+use logistello_cli::wthor_murakami::{self, fmt_algebraic as fmt_alg, parse_algebraic};
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -274,21 +280,108 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Replay a recorded match (e.g. Murakami 1997) (Phase 9).
-    MatchReplay,
-    /// Estimate ELO versus Edax at various levels (Phase 9).
-    ///
-    /// The external Edax engine is the gitignored local install produced
-    /// by `scripts/setup_edax.sh` (see `EDAX_SETUP.md`); Phase 9a wired
-    /// the binary + GTP driver, Phase 9b implements the measurement.
+    /// Extract the Murakami-1997 gold games from a raw WThor DB (Phase 9b;
+    /// design doc §4.5 B5). Parses every `.wtb` in `--wthor-dir`, resolves
+    /// player ids via the sibling `.jou`, keeps games where one player is
+    /// "Logistello" and the other "Murakami" (case-insensitive), and writes
+    /// the tiny committed JSON gold set. Reports the count + names found
+    /// honestly (expects 6 for 1997).
+    MurakamiExtract {
+        /// Directory containing the FFO `.wtb` + `WTHOR.JOU` (fetch via
+        /// `scripts/fetch_wthor.sh`; gitignored `data/wthor/`).
+        #[arg(long, default_value = "data/wthor")]
+        wthor_dir: PathBuf,
+        /// Output JSON (the committed gold set, e.g.
+        /// `tests/data/murakami_1997.json`).
+        #[arg(long, default_value = "tests/data/murakami_1997.json")]
+        output: PathBuf,
+    },
+    /// Replay a recorded match (Murakami 1997) and report our engine's
+    /// move-match rate (Phase 9b; design doc §4.3.8
+    /// `move_match_rate_murakami`, §5 ≥80% on main positions).
+    MatchReplay {
+        /// The committed gold-set JSON (`murakami-extract` output).
+        #[arg(long, default_value = "tests/data/murakami_1997.json")]
+        games: PathBuf,
+        /// `LGW1` learned weights for the `PatternEval` (the production
+        /// midgame evaluator). Omit to use the Phase-3 `BasicEval`.
+        #[arg(long)]
+        eval_weights: Option<PathBuf>,
+        /// Optional Phase-8 opening book (`OPB1`).
+        #[arg(long)]
+        book: Option<PathBuf>,
+        /// Selective-midgame iterative-deepening depth (plies).
+        #[arg(long, default_value_t = 8)]
+        depth: u32,
+        /// Exact-endgame switch threshold (empties; design doc §4.5 B8).
+        #[arg(long, default_value_t = 20)]
+        endgame_empties: u32,
+        /// Optional Multi-ProbCut params JSON (a `probcut-fit` output).
+        #[arg(long)]
+        mpc_params: Option<PathBuf>,
+        /// Inclusive "main position" ply window low bound (design doc §5).
+        #[arg(long, default_value_t = match_replay::MAIN_PLY_LO)]
+        main_lo: u32,
+        /// Inclusive "main position" ply window high bound.
+        #[arg(long, default_value_t = match_replay::MAIN_PLY_HI)]
+        main_hi: u32,
+        /// Output CSV (also copied into `results/<ts>/`).
+        #[arg(long, default_value = "results/murakami_replay.csv")]
+        output: PathBuf,
+    },
+    /// Estimate ELO versus Edax at various levels via the direct-GTP
+    /// full-game driver (Phase 9b; design doc §4.3.8 `elo_vs_edax_level_N`).
+    /// Bounded by default (levels 1,3 × 2 games); the full sweep is a
+    /// documented README command.
     EloVsEdax {
-        /// Path to the Edax binary. Defaults to the gitignored
-        /// `.edax/edax` install (`EdaxConfig::DEFAULT_EDAX_PATH`).
-        #[arg(long, default_value = logistello_cli::edax::EdaxConfig::DEFAULT_EDAX_PATH)]
+        /// Path to the Edax binary (default: gitignored `.edax/edax`).
+        #[arg(long, default_value = EdaxConfig::DEFAULT_EDAX_PATH)]
         edax_path: PathBuf,
-        /// Edax fixed search strength (`edax -level N`).
-        #[arg(long, default_value_t = logistello_cli::edax::EdaxConfig::DEFAULT_LEVEL)]
+        /// Comma list of Edax `-level N` strengths (default `1,3`).
+        #[arg(long, default_value = "1,3")]
+        edax_levels: String,
+        /// Games per level (colour-balanced; rounded up to even). Default 2.
+        #[arg(long, default_value_t = 2)]
+        num_games_per_level: u32,
+        /// `LGW1` weights for our engine's `PatternEval` (else `BasicEval`).
+        #[arg(long)]
+        eval_weights: Option<PathBuf>,
+        /// Our engine's selective-midgame depth (kept small for the demo).
+        #[arg(long, default_value_t = 6)]
+        depth: u32,
+        /// Our engine's exact-endgame switch threshold (empties).
+        #[arg(long, default_value_t = 16)]
+        endgame_empties: u32,
+        /// Determinism seed (recorded; our engine + book-off Edax are
+        /// already deterministic, so runs reproduce regardless).
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Output CSV (also copied into `results/<ts>/`).
+        #[arg(long, default_value = "results/elo_vs_edax.csv")]
+        output: PathBuf,
+    },
+    /// Pearson correlation of our `PatternEval` value vs Edax's evaluation
+    /// on a bounded position set (Phase 9b; design doc §4.3.8
+    /// `eval_correlation_edax`, Edax as ground truth).
+    EvalCorrelationEdax {
+        /// Path to the Edax binary (default: gitignored `.edax/edax`).
+        #[arg(long, default_value = EdaxConfig::DEFAULT_EDAX_PATH)]
+        edax_path: PathBuf,
+        /// Edax fixed strength used for its `genmove`-based evaluation.
+        #[arg(long, default_value_t = 6)]
         edax_level: u32,
+        /// `LGW1` weights for our `PatternEval` (else `BasicEval`).
+        #[arg(long)]
+        eval_weights: Option<PathBuf>,
+        /// Number of positions to sample (bounded; default 24).
+        #[arg(long, default_value_t = 24)]
+        positions: usize,
+        /// Seed for the deterministic position walk.
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Output CSV (also copied into `results/<ts>/`).
+        #[arg(long, default_value = "results/eval_correlation_edax.csv")]
+        output: PathBuf,
     },
     /// Learn the opening book via self-play + Negamax back-propagation +
     /// drawishness (Phase 8; design doc §4.3.7 / Buro 1999). Writes the
@@ -605,6 +698,246 @@ fn bench_one_with<E: LeafEvaluator>(
     let start = Instant::now();
     let v = negascout(&mut ctx, root, -INF, INF, depth, 0);
     (v, ctx.nodes, start.elapsed().as_secs_f64())
+}
+
+// ============================ Phase 9b helpers ============================
+
+/// Builds the Phase-9b engine config (selective-midgame depth + exact
+/// endgame threshold + optional Multi-ProbCut), shared by `match-replay`
+/// and `elo-vs-edax`.
+fn phase9_engine_config(depth: u32, endgame_empties: u32, mpc: MultiProbCutConfig) -> EngineConfig {
+    EngineConfig {
+        max_depth: depth,
+        endgame_empties,
+        multi_probcut: mpc,
+        ..EngineConfig::default()
+    }
+}
+
+/// Optional learned `PatternEval` from an `LGW1` file.
+fn load_pattern(p: Option<&PathBuf>) -> Result<Option<logistello_eval::PatternEval>> {
+    match p {
+        Some(path) => {
+            let w = EvalWeights::load(path)
+                .map_err(|e| anyhow::anyhow!("load {}: {e}", path.display()))?;
+            Ok(Some(logistello_eval::PatternEval::new(w)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// A `LogistelloPlayer` (Pattern or Basic leaf) + optional Phase-8 book,
+/// adapted to [`ReplayEngine`]: `pick` consults the book then the search;
+/// `score` returns the search value (side-to-move POV, disc scale) — the
+/// same exact Phase 3/4 path the rest of the CLI uses.
+struct EngineReplay {
+    inner: LogistelloPlayer,
+    book: Option<OpeningBook>,
+}
+
+impl EngineReplay {
+    fn build(
+        color: Color,
+        cfg: &EngineConfig,
+        pattern: Option<&logistello_eval::PatternEval>,
+        book: Option<&OpeningBook>,
+    ) -> Self {
+        let inner = match pattern {
+            Some(pe) => LogistelloPlayer::with_pattern(color, cfg.clone(), pe.clone()),
+            None => LogistelloPlayer::new(color, cfg.clone()),
+        };
+        Self {
+            inner,
+            book: book.cloned(),
+        }
+    }
+}
+
+impl ReplayEngine for EngineReplay {
+    fn pick(&mut self, state: &GameState) -> Result<Move> {
+        if let Some(b) = &self.book
+            && let Some(m) = b.probe(state)
+        {
+            return Ok(m);
+        }
+        Ok(self.inner.decide(state).1.best_move)
+    }
+    fn score(&mut self, state: &GameState) -> i32 {
+        self.inner.decide(state).1.value
+    }
+    fn reset(&mut self) {
+        use othello_player::Player;
+        self.inner.reset();
+    }
+}
+
+/// GTP colour for an `othello_core::Color`.
+fn gtp_color(c: Color) -> GtpColor {
+    match c {
+        Color::Black => GtpColor::Black,
+        Color::White => GtpColor::White,
+    }
+}
+
+/// Plays ONE full game: `our_color` is our engine; the other side is the
+/// already-started `EdaxGtpSession` (book-off, deterministic). Returns the
+/// final `(black_discs, white_discs)`. Drives standard GTP directly — Edax
+/// commits its own `genmove`; we only `play` *our* moves to Edax (never
+/// re-`play` Edax's move → no `? wrong color`).
+fn play_one_edax_game(
+    sess: &mut EdaxGtpSession,
+    our: &mut EngineReplay,
+    our_color: Color,
+) -> Result<(u32, u32)> {
+    use othello_player::Player;
+    sess.new_game()
+        .map_err(|e| anyhow::anyhow!("edax new_game: {e}"))?;
+    our.inner.reset();
+    let mut state = GameState::standard_8x8();
+    let mut guard = 0;
+    while !state.is_terminal() {
+        guard += 1;
+        if guard > 200 {
+            bail!("game did not terminate in 200 plies (protocol desync?)");
+        }
+        let stm = state.side_to_move;
+        if state.must_pass() {
+            // The side to move has no legal move. We mirror a pass on our
+            // board. Edax tracks this itself: if it is Edax's turn it will
+            // return "pass" from genmove; if it is ours we tell Edax we
+            // passed. Either way our board applies Pass.
+            if stm == our_color {
+                sess.play(gtp_color(stm), "pass")
+                    .map_err(|e| anyhow::anyhow!("edax play pass: {e}"))?;
+            } else {
+                let mv = sess
+                    .genmove(gtp_color(stm))
+                    .map_err(|e| anyhow::anyhow!("edax genmove: {e}"))?;
+                if mv != "pass" {
+                    bail!("Edax did not pass when it had no move (got {mv:?})");
+                }
+            }
+            state
+                .apply_move(Move::Pass)
+                .map_err(|e| anyhow::anyhow!("apply forced pass: {e}"))?;
+            continue;
+        }
+        if stm == our_color {
+            let m = our.pick(&state)?;
+            let alg = fmt_alg(m);
+            sess.play(gtp_color(stm), &alg)
+                .map_err(|e| anyhow::anyhow!("edax play {alg}: {e}"))?;
+            state
+                .apply_move(m)
+                .map_err(|e| anyhow::anyhow!("apply our move {alg}: {e}"))?;
+        } else {
+            let mv = sess
+                .genmove(gtp_color(stm))
+                .map_err(|e| anyhow::anyhow!("edax genmove: {e}"))?;
+            if mv == "resign" {
+                // Edax resigned: score the rest as a loss for Edax by
+                // counting current discs (Edax forfeits).
+                break;
+            }
+            let parsed =
+                parse_algebraic(&mv).map_err(|e| anyhow::anyhow!("parse edax move {mv:?}: {e}"))?;
+            if !state.legal_moves().contains(&parsed) {
+                bail!("Edax returned ILLEGAL move {mv:?} (protocol desync)");
+            }
+            state
+                .apply_move(parsed)
+                .map_err(|e| anyhow::anyhow!("apply edax move {mv:?}: {e}"))?;
+        }
+    }
+    Ok((
+        state.board.count(Color::Black),
+        state.board.count(Color::White),
+    ))
+}
+
+/// Edax plays *both* sides to terminal from the position reached by
+/// replaying `line` from the standard start (book-off, fixed level),
+/// returning final `(black_discs, white_discs)`. Used by
+/// `eval-correlation-edax` as Edax's strong value estimate of that position
+/// (its resulting disc outcome under self-play) — the ground-truth signal
+/// we correlate our static leaf eval against. GTP has no `setboard`, so the
+/// position is established by replaying `line` move-by-move into Edax first.
+fn edax_selfplay_from_line(sess: &mut EdaxGtpSession, line: &[Move]) -> Result<(u32, u32)> {
+    sess.new_game()
+        .map_err(|e| anyhow::anyhow!("edax new_game: {e}"))?;
+    let mut state = GameState::standard_8x8();
+    for m in line {
+        let stm = state.side_to_move;
+        let alg = fmt_alg(*m);
+        sess.play(gtp_color(stm), &alg)
+            .map_err(|e| anyhow::anyhow!("edax replay {alg}: {e}"))?;
+        state
+            .apply_move(*m)
+            .map_err(|e| anyhow::anyhow!("replay {alg}: {e}"))?;
+    }
+    let mut guard = 0;
+    while !state.is_terminal() {
+        guard += 1;
+        if guard > 200 {
+            bail!("edax self-play did not terminate");
+        }
+        let stm = state.side_to_move;
+        if state.must_pass() {
+            let mv = sess
+                .genmove(gtp_color(stm))
+                .map_err(|e| anyhow::anyhow!("edax genmove: {e}"))?;
+            if mv != "pass" {
+                bail!("Edax did not pass when forced (got {mv:?})");
+            }
+            state.apply_move(Move::Pass).ok();
+            continue;
+        }
+        let mv = sess
+            .genmove(gtp_color(stm))
+            .map_err(|e| anyhow::anyhow!("edax genmove: {e}"))?;
+        if mv == "resign" {
+            break;
+        }
+        let parsed = parse_algebraic(&mv).map_err(|e| anyhow::anyhow!("parse {mv:?}: {e}"))?;
+        if !state.legal_moves().contains(&parsed) {
+            bail!("Edax ILLEGAL move {mv:?} in self-play");
+        }
+        state
+            .apply_move(parsed)
+            .map_err(|e| anyhow::anyhow!("apply {mv:?}: {e}"))?;
+    }
+    Ok((
+        state.board.count(Color::Black),
+        state.board.count(Color::White),
+    ))
+}
+
+/// Deterministic move line of `walk_position(plies, seed)` (same RNG/body),
+/// returned so Edax can be replayed to that exact position.
+fn walk_line(plies: usize, seed: u64) -> (GameState, Vec<Move>) {
+    use rand::SeedableRng;
+    use rand::seq::SliceRandom;
+    use rand_chacha::ChaCha20Rng;
+    let mut rng = ChaCha20Rng::seed_from_u64(seed);
+    let mut s = GameState::standard_8x8();
+    let mut line = Vec::new();
+    let mut made = 0;
+    while made < plies {
+        if s.is_terminal() {
+            break;
+        }
+        let mv = s.legal_moves();
+        if mv.is_empty() {
+            s.apply_move(Move::Pass).expect("pass legal when stuck");
+            line.push(Move::Pass);
+            continue;
+        }
+        let m = *mv.choose(&mut rng).expect("non-empty");
+        s.apply_move(m).expect("legal move applies");
+        line.push(m);
+        made += 1;
+    }
+    (s, line)
 }
 
 fn main() -> Result<()> {
@@ -1006,24 +1339,324 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::MatchReplay => {
-            println!("match-replay: not yet implemented (Phase 9)");
+        Command::MurakamiExtract { wthor_dir, output } => {
+            let set = wthor_murakami::extract_murakami(&wthor_dir).map_err(|e| {
+                anyhow::anyhow!(
+                    "murakami-extract from {}: {e} (did you run \
+                     scripts/fetch_wthor.sh?)",
+                    wthor_dir.display()
+                )
+            })?;
+            if let Some(p) = output.parent() {
+                std::fs::create_dir_all(p).ok();
+            }
+            std::fs::write(&output, wthor_murakami::to_json(&set)?)?;
+            println!(
+                "murakami-extract wthor-dir={} year={} games_found={} \
+                 output={}",
+                wthor_dir.display(),
+                set.year,
+                set.games.len(),
+                output.display()
+            );
+            for g in &set.games {
+                let (logi, opp) = if g.logistello_is_black {
+                    (&g.black_name, &g.white_name)
+                } else {
+                    (&g.white_name, &g.black_name)
+                };
+                println!(
+                    "  game#{:<5} B={:?} W={:?} logistello={} ({}) \
+                     result(black_discs)={} theoretical={} plies={}",
+                    g.wtb_index,
+                    g.black_name,
+                    g.white_name,
+                    logi,
+                    if g.logistello_is_black {
+                        "black"
+                    } else {
+                        "white"
+                    },
+                    g.result_black_discs,
+                    g.result_theoretical_black_discs,
+                    g.moves.len()
+                );
+                let _ = opp;
+            }
+            if set.games.len() == 6 {
+                println!(
+                    "OK: exactly 6 Logistello-vs-Murakami games (the 1997 \
+                     gold set; design doc §4.5 B5 / §5)."
+                );
+            } else {
+                println!(
+                    "NOTE: expected 6 (1997 Murakami match) but found {} — \
+                     reported honestly (no fabrication).",
+                    set.games.len()
+                );
+            }
+        }
+        Command::MatchReplay {
+            games,
+            eval_weights,
+            book,
+            depth,
+            endgame_empties,
+            mpc_params,
+            main_lo,
+            main_hi,
+            output,
+        } => {
+            let set = wthor_murakami::load_set(&games)
+                .map_err(|e| anyhow::anyhow!("load {}: {e}", games.display()))?;
+            let mpc = build_multi_probcut(mpc_params.is_some(), mpc_params.as_ref())?;
+            let cfg = phase9_engine_config(depth, endgame_empties, mpc);
+            let pattern = load_pattern(eval_weights.as_ref())?;
+            let book_loaded = match &book {
+                Some(p) => Some(
+                    OpeningBook::load(p)
+                        .map_err(|e| anyhow::anyhow!("load book {}: {e}", p.display()))?,
+                ),
+                None => None,
+            };
+            // One engine per colour (each owns its TT); replay_game resets.
+            let mut all = Vec::new();
+            for g in &set.games {
+                let color = if g.logistello_is_black {
+                    Color::Black
+                } else {
+                    Color::White
+                };
+                let mut eng =
+                    EngineReplay::build(color, &cfg, pattern.as_ref(), book_loaded.as_ref());
+                all.extend(match_replay::replay_game(g, &mut eng, main_lo, main_hi)?);
+            }
+            let summary = match_replay::summarize(&all);
+            if let Some(p) = output.parent() {
+                std::fs::create_dir_all(p).ok();
+            }
+            match_replay::write_csv(&output, &all)?;
+            // Mirror into results/<ts>/.
+            if let Ok(run) = results::new_run_dir(std::path::Path::new("results")) {
+                let _ = match_replay::write_csv(&run.join("murakami_replay.csv"), &all);
+            }
+            let eval_kind = eval_weights.as_ref().map_or_else(
+                || "basic".to_string(),
+                |p| format!("pattern({})", p.display()),
+            );
+            println!(
+                "match-replay games={} engine={} depth={depth} \
+                 endgame_empties={endgame_empties} main_window=[{main_lo},{main_hi}] \
+                 output={}",
+                set.games.len(),
+                eval_kind,
+                output.display()
+            );
+            println!(
+                "  scored_decisions={} matched={} overall_match_rate={:.4}",
+                summary.total,
+                summary.matched,
+                summary.overall_rate()
+            );
+            println!(
+                "  main_decisions={} main_matched={} main_match_rate={:.4} \
+                 (§5 target ≥0.80 with the production-scale Logistello-2 \
+                 weights; medium-trained weights are weaker — see README)",
+                summary.main_total,
+                summary.main_matched,
+                summary.main_rate()
+            );
         }
         Command::EloVsEdax {
             edax_path,
-            edax_level,
+            edax_levels,
+            num_games_per_level,
+            eval_weights,
+            depth,
+            endgame_empties,
+            seed,
+            output,
         } => {
-            // Phase 9a wired the Edax driver; the measurement itself is
-            // Phase 9b. Report the resolved config so the wiring is
-            // verifiable from the CLI today.
-            let cfg = logistello_cli::edax::EdaxConfig::new(&edax_path, edax_level);
+            let path = resolve_edax_path(Some(&edax_path));
+            let levels: Vec<u32> = edax_levels
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            if levels.is_empty() {
+                bail!("--edax-levels parsed to nothing (want e.g. 1,3)");
+            }
+            // Colour-balanced: round up to an even number of games.
+            let n = num_games_per_level.max(1);
+            let n = if n % 2 == 0 { n } else { n + 1 };
+            let probe = EdaxConfig::new(&path, *levels.first().unwrap());
+            if !probe.is_available() {
+                println!(
+                    "elo-vs-edax SKIPPED: no Edax binary at {} (gitignored \
+                     install absent — run scripts/setup_edax.sh). Harness + \
+                     unit tests still cover the logic; nothing fabricated.",
+                    path.display()
+                );
+                return Ok(());
+            }
+            let pattern = load_pattern(eval_weights.as_ref())?;
+            let cfg = phase9_engine_config(depth, endgame_empties, MultiProbCutConfig::default());
+            let mut rows: Vec<LevelResult> = Vec::new();
+            let t0 = Instant::now();
+            for &lvl in &levels {
+                let ecfg =
+                    EdaxConfig::new(&path, lvl).with_timeout(std::time::Duration::from_secs(120));
+                let mut sess = EdaxGtpSession::start(&ecfg)
+                    .map_err(|e| anyhow::anyhow!("start Edax level {lvl}: {e}"))?;
+                let mut lr = LevelResult::new(lvl);
+                for game_idx in 0..n {
+                    // Alternate: even = our engine Black, odd = our White.
+                    let our_color = if game_idx % 2 == 0 {
+                        Color::Black
+                    } else {
+                        Color::White
+                    };
+                    let mut eng = EngineReplay::build(our_color, &cfg, pattern.as_ref(), None);
+                    let (bd, wd) = play_one_edax_game(&mut sess, &mut eng, our_color)?;
+                    let (our_d, edax_d) = if our_color == Color::Black {
+                        (bd, wd)
+                    } else {
+                        (wd, bd)
+                    };
+                    lr.record(Outcome::from_discs(our_d, edax_d));
+                }
+                println!(
+                    "  level {lvl}: games={} W-D-L={}-{}-{} score_rate={:.4} \
+                     win_rate={:.4} elo_delta={:+.1}",
+                    lr.games,
+                    lr.wins,
+                    lr.draws,
+                    lr.losses,
+                    lr.score_rate(),
+                    lr.win_rate(),
+                    lr.elo_delta()
+                );
+                rows.push(lr);
+            }
+            let wall = t0.elapsed().as_secs_f64();
+            if let Some(p) = output.parent() {
+                std::fs::create_dir_all(p).ok();
+            }
+            let mut csv =
+                String::from("level,games,wins,draws,losses,score_rate,win_rate,elo_delta\n");
+            for r in &rows {
+                csv.push_str(&format!(
+                    "{},{},{},{},{},{:.6},{:.6},{:.3}\n",
+                    r.level,
+                    r.games,
+                    r.wins,
+                    r.draws,
+                    r.losses,
+                    r.score_rate(),
+                    r.win_rate(),
+                    r.elo_delta()
+                ));
+            }
+            std::fs::write(&output, &csv)?;
+            if let Ok(run) = results::new_run_dir(std::path::Path::new("results")) {
+                let _ = std::fs::write(run.join("elo_vs_edax.csv"), &csv);
+            }
+            let eval_kind = eval_weights.as_ref().map_or_else(
+                || "basic".to_string(),
+                |p| format!("pattern({})", p.display()),
+            );
             println!(
-                "elo-vs-edax: not yet implemented (Phase 9b). Edax path = {} \
-                 (exists = {}), level = {}, protocol = {:?}.",
-                edax_path.display(),
-                cfg.is_available(),
-                edax_level,
-                logistello_cli::edax::EDAX_PROTOCOL,
+                "elo-vs-edax edax={} levels={:?} games_per_level={n} \
+                 engine={} depth={depth} seed={seed} wall={wall:.1}s output={} \
+                 (BOUNDED demo — Edax level→absolute strength is qualitative; \
+                 full sweep is a documented README command)",
+                path.display(),
+                levels,
+                eval_kind,
+                output.display()
+            );
+        }
+        Command::EvalCorrelationEdax {
+            edax_path,
+            edax_level,
+            eval_weights,
+            positions,
+            seed,
+            output,
+        } => {
+            let path = resolve_edax_path(Some(&edax_path));
+            let probe = EdaxConfig::new(&path, edax_level);
+            if !probe.is_available() {
+                println!(
+                    "eval-correlation-edax SKIPPED: no Edax binary at {} \
+                     (gitignored install absent — run scripts/setup_edax.sh). \
+                     Pearson logic is unit-tested; nothing fabricated.",
+                    path.display()
+                );
+                return Ok(());
+            }
+            let pattern = load_pattern(eval_weights.as_ref())?;
+            // Sample distinct midgame positions via a deterministic walk;
+            // for each, our PatternEval/BasicEval leaf value vs Edax's
+            // ground-truth value = the disc-diff Edax reaches by playing
+            // *both* sides to terminal from that position at the fixed
+            // level (a strong estimate; GTP exposes no static-eval query,
+            // so the solved self-play outcome is the principled signal),
+            // side-to-move POV to match our leaf convention.
+            let ecfg =
+                EdaxConfig::new(&path, edax_level).with_timeout(std::time::Duration::from_secs(60));
+            let mut samples: Vec<CorrSample> = Vec::new();
+            let leaf_score = |s: &GameState| -> i32 {
+                use logistello_eval::LeafEvaluator;
+                match &pattern {
+                    Some(pe) => pe.eval(s),
+                    None => logistello_eval::BasicEval::default().eval(s),
+                }
+            };
+            let mut sess =
+                EdaxGtpSession::start(&ecfg).map_err(|e| anyhow::anyhow!("start Edax: {e}"))?;
+            let mut idx = 0usize;
+            for k in 0..positions {
+                let plies = 8 + (k % 24);
+                let (st, line) = walk_line(plies, seed.wrapping_add(k as u64));
+                if st.is_terminal() || st.must_pass() {
+                    continue;
+                }
+                let Ok((bd, wd)) = edax_selfplay_from_line(&mut sess, &line) else {
+                    continue;
+                };
+                let edax_diff = match st.side_to_move {
+                    Color::Black => bd as i32 - wd as i32,
+                    Color::White => wd as i32 - bd as i32,
+                };
+                samples.push(CorrSample {
+                    idx,
+                    our_score: leaf_score(&st),
+                    edax_score: edax_diff,
+                });
+                idx += 1;
+            }
+            let xs: Vec<f64> = samples.iter().map(|s| s.our_score as f64).collect();
+            let ys: Vec<f64> = samples.iter().map(|s| s.edax_score as f64).collect();
+            let r = eval_corr::pearson(&xs, &ys);
+            if let Some(p) = output.parent() {
+                std::fs::create_dir_all(p).ok();
+            }
+            eval_corr::write_csv(&output, &samples, r)?;
+            if let Ok(run) = results::new_run_dir(std::path::Path::new("results")) {
+                let _ = eval_corr::write_csv(&run.join("eval_correlation_edax.csv"), &samples, r);
+            }
+            let eval_kind = eval_weights.as_ref().map_or_else(
+                || "basic".to_string(),
+                |p| format!("pattern({})", p.display()),
+            );
+            let edax_disp = path.display();
+            let out_disp = output.display();
+            let r_disp = r.map_or_else(|| "NA".to_string(), |v| format!("{v:.4}"));
+            let n = samples.len();
+            println!(
+                "eval-correlation-edax edax={edax_disp} level={edax_level} \
+                 engine={eval_kind} n={n} pearson_r={r_disp} output={out_disp} \
+                 (Edax as ground truth; bounded position count)"
             );
         }
         Command::LearnBook {

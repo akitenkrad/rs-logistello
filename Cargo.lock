@@ -387,6 +387,7 @@ name = "logistello-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "logistello-book",
  "logistello-core",
@@ -398,6 +399,7 @@ dependencies = [
  "othello-player",
  "rand",
  "rand_chacha",
+ "serde",
  "serde_json",
 ]
 

@@ -10,3 +10,7 @@ __pycache__/
 # Edax external engine: platform binary + multi-MB eval weights (Phase 9a).
 # Regenerate locally via scripts/setup_edax.sh (see EDAX_SETUP.md). Never committed.
 /.edax/
+# Raw third-party WTHOR DB (FFO `.wtb`/`.jou`/`.trn`; Phase 9b). Fetched
+# locally via scripts/fetch_wthor.sh; never committed. The tiny *derived*
+# 6-game Murakami gold set lives in tests/data/ (committed, see Phase 9b).
+/data/

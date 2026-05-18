@@ -17,12 +17,26 @@
 //!   Phase 7). Owns the base-literal extraction (mirrors `extract`'s "Rust
 //!   owns canonicalisation") and emits the documented `GLX1` columnar
 //!   binary the Python `train-glem` tool consumes.
-//! - [`edax`] — shared Edax v4.6 external-engine configuration (design doc
-//!   §4.5 B5; Phase 9a). The single place that knows how to drive the
-//!   locally built, gitignored `.edax/edax` binary; consumed by Phase 9b's
-//!   `elo-vs-edax`.
+//! - [`edax`] — shared Edax v4.6 external-engine configuration + the
+//!   Phase-9b [`edax::EdaxGtpSession`] direct-GTP full-game driver (design
+//!   doc §4.5 B5). The single place that knows how to drive the locally
+//!   built, gitignored `.edax/edax` binary.
+//! - [`wthor_murakami`] — Murakami-1997 gold-set extraction from the raw
+//!   WThor `.wtb`+`.jou` DB (design doc §4.5 B5; Phase 9b `murakami-extract`).
+//! - [`match_replay`] — recorded-match replay + move-match-rate scoring
+//!   (design doc §4.3.8 `move_match_rate_murakami`; Phase 9b `match-replay`).
+//! - [`elo`] — Elo-delta / win-rate aggregation vs Edax (design doc §4.3.8
+//!   `elo_vs_edax_level_N`; Phase 9b `elo-vs-edax`).
+//! - [`eval_corr`] — Pearson correlation of our eval vs Edax's (design doc
+//!   §4.3.8 `eval_correlation_edax`; Phase 9b `eval-correlation-edax`).
+//! - [`results`] — the §4.2 `results/<ts>/` + `results/latest` layout.
 
 pub mod edax;
+pub mod elo;
+pub mod eval_corr;
 pub mod extract;
 pub mod glem_extract;
+pub mod match_replay;
 pub mod probcut_fit;
+pub mod results;
+pub mod wthor_murakami;

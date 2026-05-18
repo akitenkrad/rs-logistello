@@ -279,6 +279,190 @@ impl EdaxConfig {
     }
 }
 
+/// Side to move, for GTP `genmove`/`play` colour words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GtpColor {
+    /// GTP `black`.
+    Black,
+    /// GTP `white`.
+    White,
+}
+
+impl GtpColor {
+    /// The GTP colour word.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            GtpColor::Black => "black",
+            GtpColor::White => "white",
+        }
+    }
+}
+
+/// A long-lived, direct GTP session over one Edax process — the Phase-9b
+/// full-game driver (design doc §4.5 **B5**).
+///
+/// This is the **only** correct way to play a complete game against the
+/// pinned-`rs-othello-sim`-incompatible real Edax (see the module-level
+/// "Known limitation"): we drive standard GTP ourselves and **never
+/// re-`play` Edax's own move**.
+///
+/// Protocol discipline, per ply:
+/// - Edax to move: [`genmove`](Self::genmove) → Edax searches *and commits*
+///   the move internally (advancing its side to move). We record the
+///   returned coordinate and apply it to *our* mirror board. We do **not**
+///   send `play <color> <that move>` back — that is exactly the
+///   `? wrong color` bug the Phase-9a notes describe.
+/// - our engine to move: compute locally, then [`play`](Self::play) so
+///   Edax's internal board stays in lockstep with ours.
+///
+/// [`new_game`](Self::new_game) (`boardsize 8` + `clear_board`) resets a
+/// game; [`Drop`] sends `quit` and reaps the child so no process leaks.
+pub struct EdaxGtpSession {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    rx: std::sync::mpsc::Receiver<Result<String, String>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    timeout: Duration,
+}
+
+impl EdaxGtpSession {
+    /// Spawns Edax with `cfg.args()` (deterministic, book-off, GTP). The
+    /// caller must then call [`new_game`](Self::new_game) before play.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the binary is missing or cannot be spawned.
+    pub fn start(cfg: &EdaxConfig) -> std::io::Result<Self> {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+        use std::thread;
+
+        let mut child = Command::new(&cfg.binary)
+            .args(cfg.args())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("no stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("no stdout"))?;
+
+        // Reader thread parses `= body\n\n` / `? err\n\n` responses and
+        // forwards each over a channel (same discipline as
+        // `genmove_from_start`). It only needs `stdout`; `stdin` stays
+        // owned by the session so commands can be sent synchronously.
+        let (tx, rx) = mpsc::channel::<Result<String, String>>();
+        let reader = thread::spawn(move || {
+            let mut r = BufReader::new(stdout);
+            let mut first: Option<String> = None;
+            loop {
+                let mut line = String::new();
+                match r.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                let t = line.trim_end_matches(['\r', '\n']).to_string();
+                if t.is_empty() {
+                    if let Some(h) = first.take() {
+                        let msg = if let Some(b) = h.strip_prefix('=') {
+                            Ok(b.trim().to_string())
+                        } else if let Some(e) = h.strip_prefix('?') {
+                            Err(e.trim().to_string())
+                        } else {
+                            Err(format!("unexpected GTP line: {h:?}"))
+                        };
+                        if tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                } else if first.is_none() {
+                    first = Some(t);
+                }
+            }
+        });
+
+        Ok(Self {
+            child,
+            stdin,
+            rx,
+            reader: Some(reader),
+            timeout: cfg.timeout,
+        })
+    }
+
+    /// Sends one GTP command line and returns the response body (the text
+    /// after `= `), or an `Err` carrying Edax's `?` message / a timeout.
+    fn cmd(&mut self, line: &str) -> std::io::Result<String> {
+        use std::io::Write;
+        writeln!(self.stdin, "{line}")?;
+        self.stdin.flush()?;
+        self.rx
+            .recv_timeout(self.timeout)
+            .map_err(|_| std::io::Error::other(format!("Edax GTP timeout on {line:?}")))?
+            .map_err(std::io::Error::other)
+    }
+
+    /// Resets Edax to a fresh standard game (`boardsize 8` + `clear_board`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates a GTP / timeout error.
+    pub fn new_game(&mut self) -> std::io::Result<()> {
+        self.cmd("boardsize 8")?;
+        self.cmd("clear_board")?;
+        Ok(())
+    }
+
+    /// Asks Edax for a move for `color`. Edax **commits** it internally;
+    /// the caller must apply it to its mirror board and **must not**
+    /// `play` it back. Returns the lowercase coordinate (`"f5"`) or
+    /// `"pass"` / `"resign"`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a GTP / timeout error.
+    pub fn genmove(&mut self, color: GtpColor) -> std::io::Result<String> {
+        Ok(self
+            .cmd(&format!("genmove {}", color.word()))?
+            .to_ascii_lowercase())
+    }
+
+    /// Notifies Edax that `color` played `mv` (lowercase algebraic, or
+    /// `"pass"`). Only ever called for **our engine's** moves so Edax's
+    /// board mirrors ours; never for a move Edax itself generated.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a GTP / timeout error (e.g. Edax rejecting an illegal
+    /// move) so the caller can surface protocol desyncs instead of
+    /// silently corrupting the game.
+    pub fn play(&mut self, color: GtpColor, mv: &str) -> std::io::Result<()> {
+        self.cmd(&format!("play {} {mv}", color.word()))?;
+        Ok(())
+    }
+}
+
+impl Drop for EdaxGtpSession {
+    fn drop(&mut self) {
+        use std::io::Write;
+        let _ = writeln!(self.stdin, "quit");
+        let _ = self.stdin.flush();
+        // Closing stdin lets Edax exit; then reap so no zombie/leak.
+        let _ = self.child.wait();
+        if let Some(h) = self.reader.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 /// Resolves the Edax binary path: the CLI-provided `--edax-path` if given,
 /// otherwise [`EdaxConfig::DEFAULT_EDAX_PATH`].
 #[must_use]
