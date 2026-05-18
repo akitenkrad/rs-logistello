@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.png" alt="LOGISTELLO — a faithful Rust + Python reproduction of Michael Buro's world-champion Othello program (beat Takeshi Murakami 6–0, 1997)" width="100%">
+</p>
+
 # replication-logistello
 
 A faithful Rust + Python reproduction of Michael Buro's **Logistello** Othello
@@ -30,6 +34,8 @@ replication-logistello/
 ├── Cargo.toml                  Rust virtual workspace
 ├── pyproject.toml              Python (uv) workspace
 ├── crates/
+│   ├── logistello/             umbrella library — re-exports the crates below
+│   │                           so downstream code can `use logistello::…`
 │   ├── logistello-core/        Zobrist hashing, perft, board constants
 │   ├── logistello-eval/        pattern evaluation (inference side)
 │   ├── logistello-search/      NegaScout/PVS, TT, killers, (Multi-)ProbCut
@@ -38,6 +44,8 @@ replication-logistello/
 ├── tools/
 │   └── src/logistello_tools/   Python: WTHOR extract, eval/GLEM training,
 │                               visualization, experiment settings
+├── scripts/                    Edax build / WThor fetch / banner generation
+├── assets/                     README banner (assets/banner.png)
 ├── tests/
 │   ├── perft_test.rs           known-value perft integration test
 │   └── data/                   fixtures

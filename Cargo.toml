@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/logistello",
     "crates/logistello-core",
     "crates/logistello-eval",
     "crates/logistello-search",
@@ -13,7 +14,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 authors = ["akitenkrad <yaflam07@gmail.com>"]
-repository = "https://github.com/akitenkrad/replication-logistello"
+repository = "https://github.com/akitenkrad/rs-logistello"
 
 [workspace.dependencies]
 # --- Reused Othello library: rs-othello-sim (git, pinned) ---
@@ -27,6 +28,7 @@ logistello-core = { path = "crates/logistello-core" }
 logistello-eval = { path = "crates/logistello-eval" }
 logistello-search = { path = "crates/logistello-search" }
 logistello-book = { path = "crates/logistello-book" }
+logistello = { path = "crates/logistello" }
 
 # --- Shared third-party dependencies ---
 clap = { version = "4", features = ["derive"] }
