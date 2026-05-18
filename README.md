@@ -2,7 +2,7 @@
   <img src="assets/banner.png" alt="LOGISTELLO — a faithful Rust + Python reproduction of Michael Buro's world-champion Othello program (beat Takeshi Murakami 6–0, 1997)" width="100%">
 </p>
 
-# replication-logistello
+# logistello
 
 A faithful Rust + Python reproduction of Michael Buro's **Logistello** Othello
 program (Buro, 1994-1999).
@@ -30,7 +30,7 @@ ProbCut/Multi-ProbCut, opening-book learning) live in the `crates/` here.
 ## Workspace structure
 
 ```
-replication-logistello/
+logistello/
 ├── Cargo.toml                  Rust virtual workspace
 ├── pyproject.toml              Python (uv) workspace
 ├── crates/
@@ -364,7 +364,7 @@ trials, `sweep_config.json` + `metrics.csv`) with the Python
 MIT. See [LICENSE](LICENSE).
 
 ---
-# replication-logistello（日本語）
+# logistello（日本語）
 
 Michael Buro の Othello プログラム **Logistello** (Buro 1994-1999) の，
 Rust + Python による忠実な再現実装．
