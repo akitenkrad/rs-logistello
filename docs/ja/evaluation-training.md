@@ -1,6 +1,6 @@
 [English](../en/evaluation-training.md) | [日本語](evaluation-training.md)
 
-# 評価関数重みの学習パイプライン（Phase 4）
+# 評価関数重みの学習パイプライン
 
 評価関数は棋譜からエンドツーエンドで学習する．Rust が学習局面を抽出し
 （Edax 忠実な B4 正規化を担う），Python がステージ別線形モデルを学習し
@@ -62,7 +62,7 @@ cargo run --release -p logistello-cli -- play \
     --eval-weights /tmp/w.lgw1
 ```
 
-`--eval-weights` なしでは `play` は Phase 3 の `BasicEval`（石数 + モビリティ）
+`--eval-weights` なしでは `play` は組み込みの `BasicEval`（石数 + モビリティ）
 を使い，指定すると Edax 流の学習済み `PatternEval` を使う．
 
 > **正直な注記（B3）:** 既定の `gd` 法は希少構成ミュート付きの忠実な Buro

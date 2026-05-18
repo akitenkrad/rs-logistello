@@ -1,6 +1,6 @@
 [English](../en/murakami-replay.md) | [日本語](murakami-replay.md)
 
-# 村上 1997 戦リプレイ — ゴールド検証セット（Phase 9b）
+# 村上 1997 戦リプレイ — ゴールド検証セット
 
 1997 年の村上健 対 Logistello 戦（歴史的な 6-0 スイープ）は，本再現の
 **ゴールド検証セット**（設計ドキュメント §4.5 B5，§5）である．生の FFO
@@ -53,7 +53,7 @@ cargo run --release -p logistello-cli -- match-replay \
 |---|---|---|
 | `--games` | コミット済みゴールドセット JSON（`murakami-extract` 出力） | `tests/data/murakami_1997.json` |
 | `--eval-weights` | `PatternEval` の `LGW1` 重み．省略時は `BasicEval` | — |
-| `--book` | 任意の Phase 8 定石（`OPB1`） | — |
+| `--book` | 任意の学習済み定石（`OPB1`） | — |
 | `--depth` | 選択的中盤の反復深化深さ（プライ） | `8` |
 | `--endgame-empties` | 厳密終盤切替閾値（空きマス; B8） | `20` |
 | `--mpc-params` | 任意の Multi-ProbCut パラメータ JSON（`probcut-fit` 出力） | — |

@@ -1,6 +1,6 @@
 [English](edax-elo.md) | [日本語](../ja/edax-elo.md)
 
-# Edax oracle, Elo & eval correlation (Phase 9)
+# Edax oracle, Elo & eval correlation
 
 Edax v4.6 is the fixed-strength external opponent / non-playing oracle. It
 is a platform binary plus multi-MB evaluation weights and is therefore
@@ -27,7 +27,7 @@ there:
   `ExternalEnginePlayer` path is unusable with the pinned revision (it
   re-`play`s Edax's own move with the wrong colour). Edax is therefore
   driven via a **direct-GTP `EdaxGtpSession`** that never re-plays Edax's
-  own move (the Phase-9a `? wrong color` fix).
+  own move (the `? wrong color` fix).
 
 ## `elo-vs-edax` — estimate Elo vs Edax
 

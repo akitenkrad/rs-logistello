@@ -1,6 +1,6 @@
 [English](opening-book.md) | [日本語](../ja/opening-book.md)
 
-# Opening-book learning (Phase 8)
+# Opening-book learning
 
 `learn-book` reproduces Buro's opening-book learning (Buro 1999, design doc
 §4.3.7): it learns the book by **self-play + Negamax back-propagation +

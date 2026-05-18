@@ -1,6 +1,6 @@
 [English](../en/edax-elo.md) | [日本語](edax-elo.md)
 
-# Edax オラクル，Elo，評価相関（Phase 9）
+# Edax オラクル，Elo，評価相関
 
 Edax v4.6 は固定強度の外部対戦相手／非対局オラクルである．プラットフォーム
 バイナリと数 MB の評価重みを伴うため，**決してコミットしない**（`.edax/`
@@ -27,7 +27,7 @@ bash scripts/setup_edax.sh   # Edax v4.6 をビルドし eval.dat を .edax/ へ
   `GtpProtocol` / `ExternalEnginePlayer` パスは固定リビジョンでは使えない
   （Edax 自身の手を誤った色で再 `play` する）．そこで Edax は，Edax
   自身の手を再生しない**直接 GTP の `EdaxGtpSession`**で駆動する
-  （Phase 9a の `? wrong color` 修正）．
+  （`? wrong color` 修正）．
 
 ## `elo-vs-edax` — Edax 比 Elo を推定する
 

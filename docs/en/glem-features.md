@@ -1,10 +1,10 @@
 [English](glem-features.md) | [日本語](../ja/glem-features.md)
 
-# GLEM auto-generated features (Phase 7)
+# GLEM auto-generated features
 
 GLEM (Generalized Linear Evaluation Model, Buro 1998 CG'98) auto-generates
 conjunction features over a set of base literals, then fits a linear model
-over them. Rust owns the base-literal extraction (mirroring Phase-4b
+over them. Rust owns the base-literal extraction (mirroring
 `extract`'s "Rust owns canonicalisation"); Python generates the conjunctions
 and fits the model. See
 [`GLEM_FORMAT.md`](../../crates/logistello-eval/GLEM_FORMAT.md) for the `GLX1`

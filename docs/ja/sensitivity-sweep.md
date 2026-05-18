@@ -1,6 +1,6 @@
 [English](../en/sensitivity-sweep.md) | [日本語](sensitivity-sweep.md)
 
-# 感度分析（`sweep`）+ 可視化（Phase 10）
+# 感度分析（`sweep`）+ 可視化
 
 `sweep` は設計ドキュメント §6 の感度分析を実行する．**1 つ**の §6
 パラメータをそのグリッド（両端含む `min/max/step`，GLEM サポートは対数

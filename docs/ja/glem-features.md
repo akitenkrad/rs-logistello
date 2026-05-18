@@ -1,10 +1,10 @@
 [English](../en/glem-features.md) | [日本語](glem-features.md)
 
-# GLEM 自動生成特徴量（Phase 7）
+# GLEM 自動生成特徴量
 
 GLEM（一般化線形評価モデル，Buro 1998 CG'98）は基底リテラル集合上に連言
 特徴を自動生成し，その上で線形モデルを学習する．Rust が基底リテラル抽出を
-担い（Phase 4b `extract` の「Rust が正規化を担う」と同様），Python が連言を
+担い（`extract` の「Rust が正規化を担う」と同様），Python が連言を
 生成してモデルを学習する．`GLX1` 抽出 / `GLM1` モデル形式は
 [`GLEM_FORMAT.md`](../../crates/logistello-eval/GLEM_FORMAT.md)を参照．
 

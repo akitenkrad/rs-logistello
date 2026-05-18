@@ -1,6 +1,6 @@
 [English](../en/opening-book.md) | [日本語](opening-book.md)
 
-# 定石学習（Phase 8）
+# 定石学習
 
 `learn-book` は Buro の定石学習（Buro 1999，設計ドキュメント §4.3.7）を
 再現する．**自己対局 + Negamax バックプロパゲーション + drawishness** で

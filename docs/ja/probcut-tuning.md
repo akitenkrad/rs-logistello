@@ -1,6 +1,6 @@
 [English](../en/probcut-tuning.md) | [日本語](probcut-tuning.md)
 
-# ProbCut と Multi-ProbCut のチューニング（Phase 5-6）
+# ProbCut と Multi-ProbCut のチューニング
 
 > **ProbCut とは（正直な説明）:** ProbCut / Multi-ProbCut は**不健全な
 > 前向き枝刈り**である．厳密ではなく*統計的*である．深さ `d` の浅い
@@ -11,7 +11,7 @@
 > R² ≈ 0.83 だが，学習済みパターン評価では設計ドキュメント §4.5 B7 の目標
 > は R² > 0.96 である（B7）．
 
-## `probcut-fit` — `(a, b, σ)` 係数の当てはめ（Phase 5/6）
+## `probcut-fit` — `(a, b, σ)` 係数の当てはめ
 
 `probcut-fit` はサンプル各局面で，必要な各深さの真値
 `v_x = NegaScout(x)` を本番 TT 規律下（ProbCut/MPC OFF）で測定し，

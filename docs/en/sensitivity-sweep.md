@@ -1,6 +1,6 @@
 [English](sensitivity-sweep.md) | [日本語](../ja/sensitivity-sweep.md)
 
-# Sensitivity analysis (`sweep`) + visualisation (Phase 10)
+# Sensitivity analysis (`sweep`) + visualisation
 
 `sweep` runs the design-doc §6 sensitivity analysis: it expands **one** §6
 parameter into its grid (inclusive `min/max/step`, log-scale for GLEM

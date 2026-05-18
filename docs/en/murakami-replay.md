@@ -1,6 +1,6 @@
 [English](murakami-replay.md) | [日本語](../ja/murakami-replay.md)
 
-# Murakami-1997 replay — the gold validation set (Phase 9b)
+# Murakami-1997 replay — the gold validation set
 
 The 1997 Takeshi Murakami vs. Logistello match (the historical 6-0 sweep)
 is the reproduction's **gold validation set** (design doc §4.5 B5, §5). The
@@ -53,7 +53,7 @@ cargo run --release -p logistello-cli -- match-replay \
 |---|---|---|
 | `--games` | The committed gold-set JSON (`murakami-extract` output) | `tests/data/murakami_1997.json` |
 | `--eval-weights` | `LGW1` weights for `PatternEval`; omit to use `BasicEval` | — |
-| `--book` | Optional Phase-8 opening book (`OPB1`) | — |
+| `--book` | Optional learned opening book (`OPB1`) | — |
 | `--depth` | Selective-midgame iterative-deepening depth (plies) | `8` |
 | `--endgame-empties` | Exact-endgame switch threshold (empties; B8) | `20` |
 | `--mpc-params` | Optional Multi-ProbCut params JSON (a `probcut-fit` output) | — |

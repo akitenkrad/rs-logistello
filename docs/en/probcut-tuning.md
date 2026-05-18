@@ -1,6 +1,6 @@
 [English](probcut-tuning.md) | [日本語](../ja/probcut-tuning.md)
 
-# ProbCut & Multi-ProbCut tuning (Phases 5-6)
+# ProbCut & Multi-ProbCut tuning
 
 > **What ProbCut is (honest):** ProbCut / Multi-ProbCut are **unsound
 > forward prunes**. They are *statistical*, not exact: a shallow probe
@@ -11,7 +11,7 @@
 > evaluator: with the trivial `BasicEval` R² ≈ 0.83, but with the learned
 > pattern evaluator the design-doc §4.5 B7 target is R² > 0.96 (B7).
 
-## `probcut-fit` — fit `(a, b, σ)` coefficients (Phase 5/6)
+## `probcut-fit` — fit `(a, b, σ)` coefficients
 
 For every sampled position `probcut-fit` measures the true `v_x =
 NegaScout(x)` for each needed depth under the production TT discipline

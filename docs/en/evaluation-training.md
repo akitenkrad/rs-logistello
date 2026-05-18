@@ -1,6 +1,6 @@
 [English](evaluation-training.md) | [日本語](../ja/evaluation-training.md)
 
-# Evaluation-weight training pipeline (Phase 4)
+# Evaluation-weight training pipeline
 
 The evaluation function is trained from games end-to-end: Rust extracts
 training positions (it owns the Edax-faithful B4 canonicalisation), Python
@@ -63,7 +63,7 @@ cargo run --release -p logistello-cli -- play \
     --eval-weights /tmp/w.lgw1
 ```
 
-Without `--eval-weights`, `play` uses the Phase 3 `BasicEval` (disc count +
+Without `--eval-weights`, `play` uses the built-in `BasicEval` (disc count +
 mobility); with it, the engine uses the learned Edax-style `PatternEval`.
 
 > **Honest notes (B3):** the default `gd` method is the faithful Buro B3

@@ -58,14 +58,14 @@ the local perft are wired correctly end-to-end.
 
 Detailed, per-use-case guides (each bilingual EN/JA):
 
-- [Getting started](docs/en/getting-started.md) — build, `perft`, `play`, `bench-search`, `selfplay` (Phases 1-3).
-- [Evaluation training](docs/en/evaluation-training.md) — `extract` + Python `train-eval` → learned `PatternEval` (Phase 4).
-- [ProbCut tuning](docs/en/probcut-tuning.md) — `probcut-fit`, single ProbCut & Multi-ProbCut (Phases 5-6).
-- [GLEM features](docs/en/glem-features.md) — `glem-extract` + `train-glem` auto-generated conjunction features (Phase 7).
-- [Opening book](docs/en/opening-book.md) — `learn-book` self-play book learning (Phase 8).
-- [Murakami replay](docs/en/murakami-replay.md) — the 1997 6-0 gold validation set (Phase 9b).
-- [Edax & Elo](docs/en/edax-elo.md) — Edax v4.6 oracle, `elo-vs-edax`, `eval-correlation-edax` (Phase 9).
-- [Sensitivity sweep](docs/en/sensitivity-sweep.md) — `sweep` + visualisation (Phase 10).
+- [Getting started](docs/en/getting-started.md) — build, `perft`, `play`, `bench-search`, `selfplay`.
+- [Evaluation training](docs/en/evaluation-training.md) — `extract` + Python `train-eval` → learned `PatternEval`.
+- [ProbCut tuning](docs/en/probcut-tuning.md) — `probcut-fit`, single ProbCut & Multi-ProbCut.
+- [GLEM features](docs/en/glem-features.md) — `glem-extract` + `train-glem` auto-generated conjunction features.
+- [Opening book](docs/en/opening-book.md) — `learn-book` self-play book learning.
+- [Murakami replay](docs/en/murakami-replay.md) — the 1997 6-0 gold validation set.
+- [Edax & Elo](docs/en/edax-elo.md) — Edax v4.6 oracle, `elo-vs-edax`, `eval-correlation-edax`.
+- [Sensitivity sweep](docs/en/sensitivity-sweep.md) — `sweep` + visualisation.
 - [Full-scale reproduction](docs/en/full-scale-reproduction.md) — heavy, user-run paper-scale commands.
 
 Reference data-format specs: [`WEIGHTS_FORMAT.md`](crates/logistello-eval/WEIGHTS_FORMAT.md),
@@ -76,7 +76,9 @@ Reference data-format specs: [`WEIGHTS_FORMAT.md`](crates/logistello-eval/WEIGHT
 
 ## Status
 
-Phases 0-10 are wired end-to-end. The committed convenience runs use
+The full pipeline — search, pattern evaluation, ProbCut/Multi-ProbCut, GLEM,
+opening-book learning, and the Murakami/Edax validation harness — is
+implemented and verified end-to-end. The committed convenience runs use
 *medium-scale* WThor-trained weights, so move-match and Elo numbers are weaker
 than the design-doc §5 / historical targets — full-scale reproduction is
 deliberately user-run (see [Full-scale reproduction](docs/en/full-scale-reproduction.md)).

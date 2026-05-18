@@ -54,14 +54,14 @@ perft がエンドツーエンドで正しく接続されていることを確�
 
 ユースケース別の詳細ガイド（各ドキュメントは EN/JA バイリンガル）．
 
-- [はじめに](getting-started.md) — ビルド，`perft`，`play`，`bench-search`，`selfplay`（Phase 1-3）．
-- [評価関数の学習](evaluation-training.md) — `extract` + Python `train-eval` → 学習済み `PatternEval`（Phase 4）．
-- [ProbCut チューニング](probcut-tuning.md) — `probcut-fit`，単一 ProbCut と Multi-ProbCut（Phase 5-6）．
-- [GLEM 特徴量](glem-features.md) — `glem-extract` + `train-glem` 自動生成連言特徴（Phase 7）．
-- [定石学習](opening-book.md) — `learn-book` 自己対局による定石学習（Phase 8）．
-- [村上戦リプレイ](murakami-replay.md) — 1997 年 6-0 のゴールド検証セット（Phase 9b）．
-- [Edax と Elo](edax-elo.md) — Edax v4.6 オラクル，`elo-vs-edax`，`eval-correlation-edax`（Phase 9）．
-- [感度分析スイープ](sensitivity-sweep.md) — `sweep` + 可視化（Phase 10）．
+- [はじめに](getting-started.md) — ビルド，`perft`，`play`，`bench-search`，`selfplay`．
+- [評価関数の学習](evaluation-training.md) — `extract` + Python `train-eval` → 学習済み `PatternEval`．
+- [ProbCut チューニング](probcut-tuning.md) — `probcut-fit`，単一 ProbCut と Multi-ProbCut．
+- [GLEM 特徴量](glem-features.md) — `glem-extract` + `train-glem` 自動生成連言特徴．
+- [定石学習](opening-book.md) — `learn-book` 自己対局による定石学習．
+- [村上戦リプレイ](murakami-replay.md) — 1997 年 6-0 のゴールド検証セット．
+- [Edax と Elo](edax-elo.md) — Edax v4.6 オラクル，`elo-vs-edax`，`eval-correlation-edax`．
+- [感度分析スイープ](sensitivity-sweep.md) — `sweep` + 可視化．
 - [フルスケール再現](full-scale-reproduction.md) — 重い，ユーザ実行の論文規模コマンド．
 
 データ形式リファレンス仕様:
@@ -73,7 +73,9 @@ perft がエンドツーエンドで正しく接続されていることを確�
 
 ## ステータス
 
-Phase 0-10 はエンドツーエンドで動作する．コミットされた簡易実行は
+探索，パターン評価，ProbCut/Multi-ProbCut，GLEM，定石学習，および
+村上／Edax 検証ハーネスを含むパイプライン全体が，エンドツーエンドで
+実装・検証済みである．コミットされた簡易実行は
 *中規模* の WThor 学習重みを使うため，着手一致率や Elo は設計ドキュメント §5
 ／歴史的目標より弱い．フルスケール再現は意図的にユーザ実行とする
 （[フルスケール再現](full-scale-reproduction.md) を参照）．

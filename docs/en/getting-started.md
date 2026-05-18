@@ -1,6 +1,6 @@
 [English](getting-started.md) | [日本語](../ja/getting-started.md)
 
-# Getting started (Phases 1-3)
+# Getting started
 
 All commands are run from the repository root. See the
 [root README](../../README.md) for installation.
@@ -14,7 +14,7 @@ cargo clippy
 cargo fmt --check
 ```
 
-## `perft` — correctness anchor (Phase 1)
+## `perft` — correctness anchor
 
 `perft` enumerates the search tree from the standard starting position and
 verifies it against known Othello perft values. It is the correctness anchor
@@ -28,7 +28,7 @@ cargo run --release -p logistello-cli -- perft --depth 6   # => perft(depth=6) =
 |---|---|---|
 | `--depth` | Plies to enumerate from the standard starting position | `6` |
 
-## `play` — play a single game (Phase 3)
+## `play` — play a single game
 
 `play` plays a single game between two players to the terminal. Each side is
 one of `engine` (Logistello: basic eval + iterative deepening + exact
@@ -52,16 +52,16 @@ cargo run --release -p logistello-cli -- play \
 | `--mpc` / `--mpc-params` | Multi-ProbCut (see [ProbCut tuning](probcut-tuning.md)) | off |
 | `--book` | Optional learned opening book `OPB1` (see [opening book](opening-book.md)) | — |
 
-Without `--eval-weights`, `play` uses the Phase 3 `BasicEval` (disc count +
+Without `--eval-weights`, `play` uses the built-in `BasicEval` (disc count +
 mobility); with it, the engine uses the learned Edax-style `PatternEval`. A
 single full game also writes the design-doc §4.2 single-run layout
 (`config.json` + `metrics.csv`) into a fresh `results/<YYYYMMDD_HHMMSS>/`
 (refreshing `results/latest`), consumable by `visualize` (see
 [sensitivity sweep](sensitivity-sweep.md)).
 
-## `bench-search` — search benchmark (Phase 2)
+## `bench-search` — search benchmark
 
-`bench-search` benchmarks the Phase 2 search from the standard opening using
+`bench-search` benchmarks the search engine from the standard opening using
 the trivial disc-difference evaluator. `--probcut` / `--mpc` run the same
 nominal depth with single ProbCut / Multi-ProbCut enabled so the speedup vs
 the exact search is observable (`probcut_speedup`).
@@ -81,7 +81,7 @@ cargo run --release -p logistello-cli -- bench-search --depth 8 --speedup
 | `--seed` | Seed for the `--from-plies` random walk | `42` |
 | `--glem-model` | Optional `GLM1` GLEM model as the leaf evaluator | — |
 
-## `selfplay` — self-play games (Phase 4)
+## `selfplay` — self-play games
 
 `selfplay` runs self-play games for data generation. It takes no options; for
 the training-position pipeline use `extract` (see

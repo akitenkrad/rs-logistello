@@ -1,6 +1,6 @@
 [English](../en/getting-started.md) | [日本語](getting-started.md)
 
-# はじめに（Phase 1-3）
+# はじめに
 
 全コマンドはリポジトリルートから実行する．インストールは
 [ルート README](README.md) を参照．
@@ -14,7 +14,7 @@ cargo clippy
 cargo fmt --check
 ```
 
-## `perft` — 正当性アンカー（Phase 1）
+## `perft` — 正当性アンカー
 
 `perft` は標準初期局面から探索木を列挙し，既知の Othello perft 値と照合する．
 再利用した合法手生成の正当性アンカーである．
@@ -27,7 +27,7 @@ cargo run --release -p logistello-cli -- perft --depth 6   # => perft(depth=6) =
 |---|---|---|
 | `--depth` | 標準初期局面から列挙するプライ数 | `6` |
 
-## `play` — 1 ゲームを対局（Phase 3）
+## `play` — 1 ゲームを対局
 
 `play` は 2 プレイヤ間で 1 ゲームをターミナルへ対局する．各サイドは
 `engine`（Logistello: 基本評価 + 反復深化 + 厳密終盤），`random`，`greedy`
@@ -51,15 +51,15 @@ cargo run --release -p logistello-cli -- play \
 | `--mpc` / `--mpc-params` | Multi-ProbCut（[ProbCut チューニング](probcut-tuning.md)を参照） | off |
 | `--book` | 任意の学習済み定石 `OPB1`（[定石学習](opening-book.md)を参照） | — |
 
-`--eval-weights` なしでは `play` は Phase 3 の `BasicEval`（石数 + モビリティ）
+`--eval-weights` なしでは `play` は組み込みの `BasicEval`（石数 + モビリティ）
 を使い，指定すると Edax 流の学習済み `PatternEval` を使う．1 ゲームの実行は
 設計ドキュメント §4.2 の単一実行レイアウト（`config.json` + `metrics.csv`）を
 新しい `results/<YYYYMMDD_HHMMSS>/` へ書き出し（`results/latest` を更新），
 `visualize` で可視化できる（[感度分析スイープ](sensitivity-sweep.md)を参照）．
 
-## `bench-search` — 探索ベンチマーク（Phase 2）
+## `bench-search` — 探索ベンチマーク
 
-`bench-search` は標準初期局面から Phase 2 探索を，自明な石差評価で
+`bench-search` は標準初期局面から探索エンジンを，自明な石差評価で
 ベンチマークする．`--probcut` / `--mpc` は同じ公称深さで単一 ProbCut /
 Multi-ProbCut を有効化し，厳密探索に対する高速化（`probcut_speedup`）を
 観測できる．
@@ -79,7 +79,7 @@ cargo run --release -p logistello-cli -- bench-search --depth 8 --speedup
 | `--seed` | `--from-plies` ランダムウォークのシード | `42` |
 | `--glem-model` | 任意の `GLM1` GLEM モデルをリーフ評価に使用 | — |
 
-## `selfplay` — 自己対局（Phase 4）
+## `selfplay` — 自己対局
 
 `selfplay` はデータ生成のための自己対局を実行する．オプションはない．
 学習局面パイプラインには `extract` を使う（[評価関数の学習](evaluation-training.md)を参照）．
