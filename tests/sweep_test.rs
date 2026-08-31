@@ -7,14 +7,14 @@
 //!   log-scale flags expand to the *exact* expected parameter sets, with
 //!   inclusive bounds and well-defined float rounding; cross-product
 //!   cardinality is correct.
-//! - **Determinism** (`determinism_*`): a tiny sweep produces a
-//!   byte-identical `metrics.csv` (deterministic columns) across two runs;
-//!   seeds are derived explicitly from `--seed` + the trial index, never
-//!   "current time".
-//! - **Output contract** (`output_contract_*`): `sweep_config.json`
-//!   round-trips the resolved spec; the `metrics.csv` header/columns match;
-//!   `results/latest` points at the new timestamped dir; the dir layout is
-//!   the §4.2 one.
+//! - **Determinism** (`determinism_*`): a tiny sweep records identical
+//!   trial events across two runs (once the run-identifying keys are taken
+//!   out); seeds are derived explicitly from `--seed` + the trial index,
+//!   never "current time".
+//! - **Output contract** (`output_contract_*`): the sweep is recorded as a
+//!   runvault parent run holding the resolved grid plus one child run per
+//!   condition, the children point back at the parent through their
+//!   lineage, and each child holds one trial event per trial.
 //! - **Metric sanity** (`metric_*`): for a cheap swept parameter the
 //!   recorded metric is plausible and monotone where §6 theory says so; a
 //!   degenerate single-point grid works.
@@ -23,11 +23,12 @@
 //!
 //! No heavy sweeps: every condition here is tiny (≤ a few search calls).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
 use logistello_cli::sweep::{
-    Axis, CSV_HEADER, Point, SweepConfigJson, SweepSpec, expand_log_range, expand_range, measure,
+    Axis, Point, SweepParameters, SweepSpec, expand_log_range, expand_range, measure,
     parse_int_list, parse_pair_list, run_sweep,
 };
 
@@ -91,7 +92,7 @@ fn grid_cross_product_cardinality() {
         ..Default::default()
     };
     let r = s.resolve().unwrap();
-    let cfg = SweepConfigJson::from_resolved(&r);
+    let cfg = SweepParameters::from_resolved(&r);
     assert_eq!(cfg.n_conditions, 7);
     assert_eq!(cfg.n_trials, 35); // 7 × 5 seeds
 }
@@ -123,11 +124,68 @@ fn grid_resolve_requires_exactly_one_axis() {
 }
 
 // --------------------------------------------------------------------- //
-//  Output contract (§4.2)                                               //
+//  Output contract (the runvault sweep parent + its children)          //
 // --------------------------------------------------------------------- //
 
-/// Runs a tiny sweep into a unique temp `results/` root.
-fn tiny_sweep(tag: &str) -> (std::path::PathBuf, Vec<logistello_cli::sweep::MetricRow>) {
+/// Reads a run directory's `run.json`.
+fn run_meta(dir: &Path) -> serde_json::Value {
+    serde_json::from_str(&fs::read_to_string(dir.join("run.json")).unwrap()).unwrap()
+}
+
+/// The conditions, which live under `parameters` in the `config.json`
+/// envelope rather than in `run.json`.
+fn run_parameters(dir: &Path) -> serde_json::Value {
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    config["parameters"].clone()
+}
+
+/// The child runs of a sweep parent, found the way `runvault.read` finds
+/// them: the parent's neighbours whose lineage points back at it.
+fn children_of(parent: &Path) -> Vec<std::path::PathBuf> {
+    let parent_uid = run_meta(parent)["run_uid"].as_str().unwrap().to_string();
+    let experiment_dir = parent.parent().unwrap();
+    let mut out: Vec<std::path::PathBuf> = fs::read_dir(experiment_dir)
+        .unwrap()
+        .filter_map(|e| {
+            let path = e.unwrap().path();
+            if path == parent || !path.join("run.json").is_file() {
+                return None;
+            }
+            let lineage = run_meta(&path)["lineage"].clone();
+            (lineage["parent_run_uid"] == serde_json::json!(parent_uid)).then_some(path)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The trial events a child recorded, with the run-identifying keys (which
+/// differ between two runs of the same sweep by design) taken out.
+fn trial_events(child: &Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(child.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+            let object = v.as_object_mut().unwrap();
+            object.remove("ts");
+            object.remove("run_uid");
+            v
+        })
+        .collect()
+}
+
+/// Runs a tiny sweep into a unique temp results root. Returns the root, the
+/// sweep parent's directory and the measured rows.
+fn tiny_sweep(
+    tag: &str,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Vec<logistello_cli::sweep::MetricRow>,
+) {
     let root = std::env::temp_dir().join(format!(
         "logi_sweep_{tag}_{}_{}",
         std::process::id(),
@@ -144,69 +202,84 @@ fn tiny_sweep(tag: &str) -> (std::path::PathBuf, Vec<logistello_cli::sweep::Metr
         ..Default::default()
     };
     let resolved = spec.resolve().unwrap();
-    let (dir, rows) = run_sweep(&resolved, &root).unwrap();
-    (dir, rows)
+    let (parent, rows) = run_sweep(&resolved, &root).unwrap();
+    (root, parent, rows)
 }
 
 #[test]
-fn output_contract_layout_and_files() {
-    let (dir, rows) = tiny_sweep("layout");
-    // §4.2: results/<ts>/{sweep_config.json, metrics.csv}.
-    let cfg_path = dir.join("sweep_config.json");
-    let csv_path = dir.join("metrics.csv");
-    assert!(cfg_path.is_file(), "sweep_config.json must exist");
-    assert!(csv_path.is_file(), "metrics.csv must exist");
+fn output_contract_parent_holds_the_resolved_grid() {
+    let (root, parent, rows) = tiny_sweep("parent");
+    assert_eq!(rows.len(), 6, "2 conditions × 3 runs = 6 trials");
 
-    // metrics.csv: header matches CSV_HEADER, 1 header + 2×3 = 6 data rows.
-    let csv = fs::read_to_string(&csv_path).unwrap();
-    let mut lines = csv.lines();
-    assert_eq!(lines.next().unwrap(), CSV_HEADER);
-    let data: Vec<&str> = lines.collect();
-    assert_eq!(data.len(), 6, "2 conditions × 3 runs = 6 trial rows");
-    assert_eq!(rows.len(), 6);
-    for l in &data {
-        assert_eq!(
-            l.split(',').count(),
-            CSV_HEADER.split(',').count(),
-            "every row has the full fixed schema"
-        );
-    }
+    let meta = run_meta(&parent);
+    assert_eq!(meta["subcommand"], "sweep");
+    assert_eq!(meta["experiment"], "logistello");
+    // The grid definition, and nothing measured: the parent is not a run of
+    // the model, it is the statement of what its children ran.
+    let params = run_parameters(&parent);
+    let params = &params;
+    assert_eq!(params["param"], "endgame_empties");
+    assert_eq!(params["metric"], "nodes");
+    assert_eq!(params["values"], serde_json::json!(["8", "12"]));
+    assert_eq!(params["runs"], 3);
+    assert_eq!(params["n_conditions"], 2);
+    assert_eq!(params["n_trials"], 6);
+    assert!(
+        !parent.join("events.jsonl").exists(),
+        "the parent measures nothing itself"
+    );
+    // A sweep parent must not claim a master seed: it is not one run of the
+    // model, and the base seed is already in /parameters.seed.
+    assert!(
+        meta["master_seed"].is_null(),
+        "no master seed on the parent"
+    );
 
-    // sweep_config.json round-trips the resolved spec.
-    let v: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&cfg_path).unwrap()).unwrap();
-    assert_eq!(v["command"], "sweep");
-    assert_eq!(v["axis"], "endgame_empties");
-    assert_eq!(v["metric"], "nodes");
-    assert_eq!(v["values"], serde_json::json!(["8", "12"]));
-    assert_eq!(v["runs"], 3);
-    assert_eq!(v["n_conditions"], 2);
-    assert_eq!(v["n_trials"], 6);
-
-    let _ = fs::remove_dir_all(dir.parent().unwrap());
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
-fn output_contract_latest_symlink() {
-    let (dir, _) = tiny_sweep("latest");
-    let root = dir.parent().unwrap();
-    let link = root.join("latest");
-    #[cfg(unix)]
-    {
-        assert!(link.exists(), "results/latest must resolve");
-        let resolved = fs::canonicalize(&link).unwrap();
-        assert_eq!(
-            resolved,
-            fs::canonicalize(&dir).unwrap(),
-            "results/latest points at the new ts dir"
-        );
+fn output_contract_one_child_per_condition_with_its_trials() {
+    let (root, parent, _) = tiny_sweep("children");
+    let children = children_of(&parent);
+    assert_eq!(children.len(), 2, "one child run per swept value");
+
+    let mut values: Vec<String> = Vec::new();
+    for child in &children {
+        let meta = run_meta(child);
+        // A different subcommand from the parent's, so `runvault path
+        // --subcommand` can tell a condition from the sweep it belongs to.
+        assert_eq!(meta["subcommand"], "sweep-point");
+        let params = run_parameters(child);
+        assert_eq!(params["param"], "endgame_empties");
+        assert_eq!(params["runs"], 3);
+        assert_eq!(params["base_seed"], 42);
+        values.push(params["value"].as_str().unwrap().to_string());
+
+        // One event per trial, carrying the seed it actually used and only
+        // the fields this axis measures.
+        let events = trial_events(child);
+        assert_eq!(events.len(), 3, "runs=3 trials in this condition");
+        for (i, e) in events.iter().enumerate() {
+            assert_eq!(e["schema"], "x.logistello.trial");
+            assert_eq!(e["unit_id"], format!("trial-{i}"));
+            assert!(e["nodes"].is_u64(), "the axis measures a node count");
+            assert!(e["dispatch"].is_string(), "dispatch is a label");
+            assert!(
+                e.get("eval_abs_err").is_none() && e.get("book_positions").is_none(),
+                "a column this axis never measured must not be written as 0"
+            );
+        }
+
+        // The condition's one number lives in the child's metrics.csv.
+        let metrics = fs::read_to_string(child.join("metrics.csv")).unwrap();
+        assert!(metrics.contains(",run,mean_nodes,"), "{metrics}");
+        assert!(metrics.contains(",run,n_units,"), "{metrics}");
     }
-    #[cfg(not(unix))]
-    {
-        let _ = link;
-        assert!(root.join("latest.txt").exists());
-    }
-    let _ = fs::remove_dir_all(root);
+    values.sort();
+    assert_eq!(values, vec!["12".to_string(), "8".to_string()]);
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 // --------------------------------------------------------------------- //
@@ -214,11 +287,15 @@ fn output_contract_latest_symlink() {
 // --------------------------------------------------------------------- //
 
 #[test]
-fn determinism_metrics_csv_byte_identical_across_runs() {
-    // A tiny sweep (1 axis × 2 values × 2 seeds) twice ⇒ the **whole**
-    // metrics.csv is byte-identical (it carries only deterministic
-    // columns; wall-clock time/nps are deliberately NOT in the CSV).
-    let make = |tag: &str| -> String {
+fn determinism_trial_events_identical_across_runs() {
+    // A tiny sweep (1 axis × 2 values × 2 seeds) twice ⇒ every recorded
+    // trial is identical. Only the run's own identity (`run_uid`, `ts`)
+    // differs, which is what makes two runs two runs.
+    //
+    // Keyed by (condition, trial) rather than compared as a list: the
+    // children's directory names carry the start time, so which child sorts
+    // first depends on whether the two starts fell in the same second.
+    let make = |tag: &str| -> BTreeMap<(String, String), serde_json::Value> {
         let root =
             std::env::temp_dir().join(format!("logi_sweep_det_{tag}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -229,21 +306,29 @@ fn determinism_metrics_csv_byte_identical_across_runs() {
             ..Default::default()
         };
         let r = spec.resolve().unwrap();
-        let (dir, _) = run_sweep(&r, &root).unwrap();
-        let csv = fs::read_to_string(dir.join("metrics.csv")).unwrap();
+        let (parent, _) = run_sweep(&r, &root).unwrap();
+        let mut trials = BTreeMap::new();
+        for child in children_of(&parent) {
+            let value = run_parameters(&child)["value"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            for event in trial_events(&child) {
+                let unit = event["unit_id"].as_str().unwrap().to_string();
+                trials.insert((value.clone(), unit), event);
+            }
+        }
         let _ = fs::remove_dir_all(&root);
-        csv
+        trials
     };
     let a = make("a");
     let b = make("b");
+    assert_eq!(a.len(), 4, "2 values × 2 seeds");
     assert_eq!(
         a, b,
-        "metrics.csv must be byte-identical across runs; per-(condition,\
-         seed) measurement is reproducible (seeds derived from --seed + \
-         trial index, never wall-clock)"
+        "per-(condition, seed) measurement is reproducible (seeds derived \
+         from --seed + trial index, never wall-clock)"
     );
-    // Sanity: the byte-identical file really does have content.
-    assert!(a.lines().count() == 5, "header + 2 values × 2 seeds");
 }
 
 #[test]
@@ -308,9 +393,14 @@ fn metric_degenerate_single_point_grid_works() {
     assert_eq!(r.points.len(), 1);
     let root = std::env::temp_dir().join(format!("logi_sweep_one_{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
-    let (dir, rows) = run_sweep(&r, &root).unwrap();
+    let (parent, rows) = run_sweep(&r, &root).unwrap();
     assert_eq!(rows.len(), 2, "1 condition × 2 runs");
-    assert!(Path::new(&dir.join("metrics.csv")).is_file());
+    // One condition ⇒ one child, and the child is where the numbers are:
+    // the parent measures nothing.
+    let children = children_of(&parent);
+    assert_eq!(children.len(), 1);
+    assert!(Path::new(&children[0].join("metrics.csv")).is_file());
+    assert_eq!(trial_events(&children[0]).len(), 2);
     let _ = fs::remove_dir_all(&root);
 }
 

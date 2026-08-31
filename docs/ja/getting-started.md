@@ -53,9 +53,36 @@ cargo run --release -p logistello-cli -- play \
 
 `--eval-weights` なしでは `play` は組み込みの `BasicEval`（石数 + モビリティ）
 を使い，指定すると Edax 流の学習済み `PatternEval` を使う．1 ゲームの実行は
-設計ドキュメント §4.2 の単一実行レイアウト（`config.json` + `metrics.csv`）を
-新しい `results/<YYYYMMDD_HHMMSS>/` へ書き出し（`results/latest` を更新），
-`visualize` で可視化できる（[感度分析スイープ](sensitivity-sweep.md)を参照）．
+runvault の run として記録され，`visualize` で可視化できる
+（[感度分析スイープ](sensitivity-sweep.md)を参照）．
+
+## 実行の記録（runvault）
+
+**測定するサブコマンド**（`play` / `bench-search` / `match-replay` /
+`elo-vs-edax` / `eval-correlation-edax` / `sweep`）は，実行を
+[runvault](https://github.com/akitenkrad/rs-runvault) の run ディレクトリ
+`<results-root>/logistello/<run-slug>/` に記録する．置き場と名前は runvault
+が決めるので，こちらではタイムスタンプ付きディレクトリも `latest` リンクも
+作らない．`--results-root`（既定 `results`）は全サブコマンド共通のフラグ．
+
+| ファイル | 中身 |
+|---|---|
+| `run.json` | 実験名・サブコマンド・分野・シード・系譜・対象論文 |
+| `config.json` | 条件（`parameters`）と，条件になるファイルの内容ハッシュ（`data`） |
+| `metrics.csv` | 数．run 全体を 1 つの値で表す量（long 形式） |
+| `events.jsonl` | 指標にできない行 — 系列で識別される観測，勝敗などのラベル |
+| `status.json` | 状態と所要時間（`duration_sec`．実行時間はこちらが正本） |
+
+**データや成果物を作るだけのサブコマンド**（`extract` / `glem-extract` /
+`probcut-fit` / `murakami-extract` / `learn-book` / `perft`）は run を作らない．
+作ったファイルは後続の run の入力であり，そちらが `config.json` の `data` に
+内容ハッシュごと載せる（パスではなく中身が結果を決めるため）．
+
+```bash
+# 実行の条件を見る / 図を描く（--results-dir 省略時は最新の run）
+uv run logistello-tools show-experiment-settings
+uv run logistello-tools visualize
+```
 
 ## `bench-search` — 探索ベンチマーク
 

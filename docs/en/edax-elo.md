@@ -41,8 +41,7 @@ level→absolute strength mapping is only qualitative (§5).
 ```bash
 cargo run --release -p logistello-cli -- elo-vs-edax \
     --edax-levels 1,3 --num-games-per-level 2 \
-    --eval-weights results/eval_weights/wthor_medium.lgw1 \
-    --output results/elo_vs_edax.csv
+    --eval-weights results/eval_weights/wthor_medium.lgw1
 ```
 
 | Flag | Meaning | Default |
@@ -53,8 +52,21 @@ cargo run --release -p logistello-cli -- elo-vs-edax \
 | `--eval-weights` | `LGW1` weights for our `PatternEval` (else `BasicEval`) | — |
 | `--depth` | Our engine's selective-midgame depth (kept small for the demo) | `6` |
 | `--endgame-empties` | Our engine's exact-endgame switch threshold (empties) | `16` |
-| `--seed` | Determinism seed (recorded) | `42` |
-| `--output` | Output CSV (also copied into `results/<ts>/`) | `results/elo_vs_edax.csv` |
+| `--seed` | Recorded, but decides nothing (see below) | `42` |
+| `--output` | Optional extra copy of the per-level table as a CSV, outside the run | — |
+
+The invocation is recorded as a runvault run. One level is one
+`x.logistello.edax_level` event (the old `elo_vs_edax.csv` row: `games`,
+`wins`, `draws`, `losses`, `score_rate`, `win_rate`, `elo_delta`), and
+`metrics.csv` carries only `n_units` — the number of observed units, here
+levels. Edax goes into `data` as **two** content hashes, the binary and its
+`eval.dat` weights: change either and the numbers change.
+
+`--seed` is accepted and recorded but **decides nothing**: our engine is
+deterministic and Edax runs single-threaded with its book off. It is
+therefore kept out of `config_hash` (so two runs of one condition stay one
+condition), and the domain is `analysis` rather than `simulation` — a run
+that draws no random numbers should not claim a master seed.
 
 ## `eval-correlation-edax` — correlate our eval against Edax
 
@@ -65,8 +77,7 @@ value vs Edax's evaluation on a bounded position set (design doc §4.3.8
 ```bash
 cargo run --release -p logistello-cli -- eval-correlation-edax \
     --edax-level 6 --positions 24 \
-    --eval-weights results/eval_weights/wthor_medium.lgw1 \
-    --output results/eval_correlation_edax.csv
+    --eval-weights results/eval_weights/wthor_medium.lgw1
 ```
 
 | Flag | Meaning | Default |
@@ -76,7 +87,14 @@ cargo run --release -p logistello-cli -- eval-correlation-edax \
 | `--eval-weights` | `LGW1` weights for our `PatternEval` (else `BasicEval`) | — |
 | `--positions` | Number of positions to sample (bounded) | `24` |
 | `--seed` | Seed for the deterministic position walk | `42` |
-| `--output` | Output CSV (also copied into `results/<ts>/`) | `results/eval_correlation_edax.csv` |
+| `--output` | Optional extra copy of the sample table as a CSV, outside the run | — |
+
+One sampled position is one `x.logistello.eval_sample` event (`our_score`,
+`edax_score`); Pearson's `r` and the sample count `n_units` are run-scope
+metrics. `r` is **undefined** for `n < 2` or a flat series, and an
+undefined value is not zero, so that row is simply not written. The sampled
+positions come from a seeded random walk, so this run's domain is
+`simulation` with `master_seed` = `--seed`.
 
 > **Caveat (honest):** the committed convenience runs use *medium-scale*
 > WThor-trained weights, so the Elo numbers are weaker than the §5 /

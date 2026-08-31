@@ -46,7 +46,7 @@ move-match rate (overall + a "main positions" ply window, design doc §4.3.8
 cargo run --release -p logistello-cli -- match-replay \
     --games tests/data/murakami_1997.json \
     --eval-weights results/eval_weights/wthor_medium.lgw1 \
-    --depth 8 --output results/murakami_replay.csv
+    --depth 8
 ```
 
 | Flag | Meaning | Default |
@@ -58,11 +58,21 @@ cargo run --release -p logistello-cli -- match-replay \
 | `--endgame-empties` | Exact-endgame switch threshold (empties; B8) | `20` |
 | `--mpc-params` | Optional Multi-ProbCut params JSON (a `probcut-fit` output) | — |
 | `--main-lo` / `--main-hi` | Inclusive "main position" ply window (design doc §5) | `10` / `50` |
-| `--output` | Output CSV (also copied into `results/<ts>/`) | `results/murakami_replay.csv` |
+| `--output` | Optional extra copy of the decision table as a CSV, outside the run | — |
 
-`match-replay` also mirrors its CSV into a timestamped
-`results/<YYYYMMDD_HHMMSS>/` directory with a `results/latest` symlink
-(design doc §4.2).
+The invocation is recorded as a runvault run (under `--results-root`,
+default `results`). Every scored decision is an `observation` event
+(`unit_id` = the game, `t` = the ply); the aggregates are run-scope metrics
+in `metrics.csv` (`scored_decisions`, `matched`, `overall_match_rate`,
+`main_decisions`, `main_matched`, `main_match_rate`, `n_units`). The gold
+games, the learned weights, the book and the MPC coefficients go into
+`config.json`'s `data` **by content hash** — a path is not a condition, so
+the same file in a different place is still the same condition.
+
+The run draws no random numbers (recorded games are replayed
+deterministically), so its domain is `analysis`. `--output` is a copy for
+whoever wants the flat table; it lives outside the run and is not the
+record.
 
 > **Caveat (honest):** the committed convenience runs use *medium-scale*
 > WThor-trained weights (a few-hundred-game corpus, minutes of training),

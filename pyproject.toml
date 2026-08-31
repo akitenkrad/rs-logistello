@@ -11,3 +11,5 @@ members = ["tools"]
 
 [tool.uv.sources]
 logistello-tools = { workspace = true }
+# runvault — run ディレクトリの読み手 (`runvault path` / `runvault.read`)．
+runvault = { git = "https://github.com/akitenkrad/rs-runvault", subdirectory = "python" }

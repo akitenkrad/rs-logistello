@@ -29,10 +29,12 @@
 //!   `elo_vs_edax_level_N`; Phase 9b `elo-vs-edax`).
 //! - [`eval_corr`] — Pearson correlation of our eval vs Edax's (design doc
 //!   §4.3.8 `eval_correlation_edax`; Phase 9b `eval-correlation-edax`).
-//! - [`results`] — the §4.2 `results/<ts>/` + `results/latest` layout.
+//! - [`record`] — how a run is recorded into runvault: the paper metadata,
+//!   the datasets whose *contents* decide a result (learned weights, the
+//!   opening book, the Edax install), and the shape of every event.
 //! - [`sweep`] — Phase 10 sensitivity analysis: §6 parameter-grid
 //!   expansion, deterministic per-`(condition, seed)` measurement, and the
-//!   §4.2 `sweep_config.json` + `metrics.csv` output contract.
+//!   sweep parent / per-condition child runs it records them into.
 
 pub mod edax;
 pub mod elo;
@@ -41,6 +43,6 @@ pub mod extract;
 pub mod glem_extract;
 pub mod match_replay;
 pub mod probcut_fit;
-pub mod results;
+pub mod record;
 pub mod sweep;
 pub mod wthor_murakami;

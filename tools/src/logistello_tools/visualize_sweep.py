@@ -1,10 +1,10 @@
-"""sweep 結果の可視化（Phase 10; 設計ドキュメント §6 / §4.2）．
+"""sweep 結果の可視化（Phase 10; 設計ドキュメント §6）．
 
-Rust `logistello sweep` が書き出す `results/<ts>/{sweep_config.json,
-metrics.csv}` を読み，**スイープした 1 パラメータ vs 指標** の依存図
-（シード試行の平均 ± 標準偏差）と，各パラメータ値（＝条件）ごとの試行を
-格子に並べた合成アニメーション `sweep_grid_animation.gif` を生成する．
-schelling1971 の `visualize_sweep.py` の規約に揃えてある:
+`logistello sweep` は sweep の親 run（掃引の格子そのもの）と，条件ごとの子 run
+（試行を `x.logistello.trial` イベントとして持つ）を書く．ここでは親から格子を，
+子から試行を集めて，**スイープした 1 パラメータ vs 指標** の依存図（シード試行
+の平均 ± 標準偏差）と，各パラメータ値（＝条件）ごとの試行を格子に並べた合成
+アニメーション `sweep_grid_animation.gif` を生成する．
 
 ```
 {output_dir}/
@@ -13,9 +13,12 @@ schelling1971 の `visualize_sweep.py` の規約に揃えてある:
 └── sweep_grid_animation.gif← 条件（パラメータ値）別 試行バーの進行アニメ
 ```
 
-`metrics.csv` 列（完全に決定的な列のみ — wall-clock は含めない）:
-`param,value,seed,nodes,search_value,dispatch,
- eval_abs_err,n_features,book_positions,selfplay_score`
+どの sweep を見るかは `--results-dir` を省略すれば runvault が答える
+(`runvault path --experiment logistello --latest --subcommand sweep`)．図は run
+ディレクトリの *隣*（`results/logistello/figures/<run_slug>/`）に置く．
+
+移行前の `results/<YYYYMMDD_HHMMSS>/{sweep_config.json, metrics.csv}`（1 行 1
+試行の wide な CSV）も `--results-dir` に直接渡せば従来どおり読める．
 
 Usage:
     logistello-tools visualize-sweep [--results-dir DIR] [--output-dir OUT]
@@ -37,6 +40,19 @@ import matplotlib.animation as animation  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
+from runvault.read import (  # noqa: E402
+    config_parameters,
+    figures_dir,
+    load_run_meta,
+    runvault_path,
+    sweep_events_table,
+)
+
+#: runvault 上の実験名 (Rust 側 `record::EXPERIMENT` と同じ)．
+EXPERIMENT = "logistello"
+
+#: 試行 1 本を表す実験固有イベント (Rust 側 `record::TRIAL_EVENT` と同じ)．
+TRIAL_EVENT = "x.logistello.trial"
 
 # --------------------------------------------------------------------------- #
 # 配色
@@ -74,12 +90,40 @@ PARAM_LABELS: dict[str, str] = {
 # 入出力ヘルパ
 # --------------------------------------------------------------------------- #
 def load_sweep_config(sweep_dir: str) -> dict | None:
-    """sweep_config.json を読み込む（無ければ None）."""
+    """掃引の定義（軸・指標・値・試行数）を読む．
+
+    runvault の sweep なら親 run の `parameters` がそれである．移行前の
+    ディレクトリは `sweep_config.json` を読む（キー名が `axis` なので `param`
+    に揃えてから返す）．
+    """
+    if load_run_meta(sweep_dir, required=False) is not None:
+        return config_parameters(sweep_dir, required=False)
     path = os.path.join(sweep_dir, "sweep_config.json")
     if os.path.exists(path):
         with open(path) as f:
-            return json.load(f)
+            cfg = json.load(f)
+        if "axis" in cfg and "param" not in cfg:
+            cfg["param"] = cfg["axis"]
+        return cfg
     return None
+
+
+def load_trials(sweep_dir: str) -> pd.DataFrame:
+    """試行を 1 行 1 試行の表にする．
+
+    runvault の sweep では試行は子 run の `events.jsonl` にあり，条件は子の
+    `parameters` にある — `sweep_events_table` が両者を突き合わせる．移行前の
+    ディレクトリは 1 行 1 試行の wide な `metrics.csv` をそのまま読む．
+    """
+    if load_run_meta(sweep_dir, required=False) is not None:
+        df = sweep_events_table(sweep_dir, ["value"], kind=TRIAL_EVENT)
+    else:
+        path = os.path.join(sweep_dir, "metrics.csv")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"metrics.csv が見つかりません: {path}")
+        df = pd.read_csv(path)
+    df["value"] = df["value"].astype(str)
+    return df
 
 
 def _value_sort_key(v: str):
@@ -318,12 +362,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--results-dir", "--results_dir", "--sweep-dir", "--sweep_dir",
-        default="results/latest",
-        help="スイープ結果ディレクトリ (default: results/latest)",
+        default=None,
+        help="sweep の親 run ディレクトリ (省略時は runvault が最新を答える)",
+    )
+    p.add_argument(
+        "--results-root", "--results_root", default="results",
+        help="run ディレクトリの置き場 (default: results)",
     )
     p.add_argument(
         "--output-dir", "--output_dir", default=None,
-        help="図の保存先 (default: {results_dir}/figures)",
+        help="図の保存先 (default: run ディレクトリの隣の figures/<run_slug>)",
     )
     p.add_argument(
         "--no-grid-animation", "--no_grid_animation", action="store_true",
@@ -340,39 +388,54 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    sweep_dir = args.results_dir
-    out_dir = args.output_dir or os.path.join(sweep_dir, "figures")
-    metrics_path = os.path.join(sweep_dir, "metrics.csv")
 
-    if not os.path.exists(metrics_path):
-        print(f"エラー: metrics.csv が見つかりません: {metrics_path}",
-              file=sys.stderr)
-        return 1
+    if args.results_dir is None:
+        try:
+            sweep_dir = runvault_path(
+                EXPERIMENT,
+                results_root=args.results_root,
+                subcommand="sweep",
+            )
+        except Exception as e:  # runvault バイナリが無い / 終わった sweep が無い
+            print(f"エラー: sweep を解決できません: {e}", file=sys.stderr)
+            return 1
+    else:
+        sweep_dir = args.results_dir
 
-    os.makedirs(out_dir, exist_ok=True)
     print("=== Logistello 感度分析スイープ 可視化 ===")
     print(f"スイープ結果: {sweep_dir}")
+
+    print("[1/4] 試行を読み込み中 ...")
+    try:
+        df = load_trials(sweep_dir)
+    except (FileNotFoundError, SystemExit) as e:
+        print(f"エラー: 試行を読めません: {e}", file=sys.stderr)
+        return 1
+    print(f"      {len(df)} 行")
+
+    out_dir = args.output_dir or figures_dir(sweep_dir)
+    os.makedirs(out_dir, exist_ok=True)
     print(f"出力先:       {out_dir}")
     print("------------------------------------------")
 
-    print("[1/4] metrics.csv を読み込み中 ...")
-    df = pd.read_csv(metrics_path)
-    df["value"] = df["value"].astype(str)
-    print(f"      {len(df)} 行")
-
-    print("[2/4] sweep_config.json を確認中 ...")
-    config = load_sweep_config(sweep_dir)
-    if config:
-        param = config.get("axis", str(df["param"].iloc[0]))
-        metric = config.get("metric", "nodes")
-    else:
-        param = str(df["param"].iloc[0])
-        # config 無し: param からデフォルト指標を推定
+    print("[2/4] 掃引の定義を確認中 ...")
+    config = load_sweep_config(sweep_dir) or {}
+    param = str(config.get("param") or df.get("param", pd.Series(["value"])).iloc[0])
+    metric = config.get("metric")
+    if metric is None:
+        # 定義が無い: 値の立っている指標列から推定する
         metric = next(
             (m for m in METRIC_LABELS
              if m in df.columns and df[m].astype(float).abs().sum() > 0),
             "nodes",
         )
+    if metric not in df.columns:
+        print(
+            f"エラー: 指標 `{metric}` の列が試行にありません "
+            f"(列: {list(df.columns)})",
+            file=sys.stderr,
+        )
+        return 1
     n_seeds = df["seed"].nunique()
     n_cond = df["value"].nunique()
     subtitle = (

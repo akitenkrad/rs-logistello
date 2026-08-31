@@ -1,8 +1,14 @@
 //! # logistello — unified CLI for the Logistello reproduction.
 //!
-//! Only `perft` is wired end-to-end so far; every other subcommand is a
-//! Phase-tagged placeholder that prints a "not yet implemented" message and
-//! returns success.
+//! Subcommands that **measure** something (`play`, `bench-search`,
+//! `match-replay`, `elo-vs-edax`, `eval-correlation-edax`, `sweep`) record
+//! themselves into a runvault run directory under `--results-root`; the
+//! directory's name and identity are runvault's, not ours. Subcommands that
+//! only *produce data or an artefact* (`extract`, `glem-extract`,
+//! `probcut-fit`, `murakami-extract`, `learn-book`, `perft`) write their
+//! `--output` file and record nothing: what they make is an input to a later
+//! run, and it is that run that carries it (as a `Dataset` with the file's
+//! content hash).
 
 use logistello_cli::edax::{EdaxConfig, EdaxGtpSession, GtpColor, resolve_edax_path};
 use logistello_cli::elo::{LevelResult, Outcome};
@@ -11,15 +17,17 @@ use logistello_cli::extract;
 use logistello_cli::glem_extract;
 use logistello_cli::match_replay::{self, ReplayEngine};
 use logistello_cli::probcut_fit;
-use logistello_cli::results;
+use logistello_cli::record;
 use logistello_cli::sweep;
 use logistello_cli::wthor_murakami::{self, fmt_algebraic as fmt_alg, parse_algebraic};
 
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use runvault::Run;
+use serde_json::json;
 
 use logistello_book::{BookConfig, OpeningBook, learn_book};
 use logistello_core::Zobrist;
@@ -45,6 +53,11 @@ use othello_player::{GreedyPlayer, Player, RandomPlayer};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Root the runvault run directories are created under. Every
+    /// measuring subcommand writes into `<root>/logistello/<run-slug>/`;
+    /// runvault owns the naming.
+    #[arg(long, global = true, default_value = "results")]
+    results_root: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -326,9 +339,11 @@ enum Command {
         /// Inclusive "main position" ply window high bound.
         #[arg(long, default_value_t = match_replay::MAIN_PLY_HI)]
         main_hi: u32,
-        /// Output CSV (also copied into `results/<ts>/`).
-        #[arg(long, default_value = "results/murakami_replay.csv")]
-        output: PathBuf,
+        /// Optional extra copy of the per-decision table as a CSV, written
+        /// outside the run. The run itself records every decision as an
+        /// `observation` event, so this is a convenience, not the record.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Estimate ELO versus Edax at various levels via the direct-GTP
     /// full-game driver (Phase 9b; design doc §4.3.8 `elo_vs_edax_level_N`).
@@ -357,9 +372,10 @@ enum Command {
         /// already deterministic, so runs reproduce regardless).
         #[arg(long, default_value_t = 42)]
         seed: u64,
-        /// Output CSV (also copied into `results/<ts>/`).
-        #[arg(long, default_value = "results/elo_vs_edax.csv")]
-        output: PathBuf,
+        /// Optional extra copy of the per-level table as a CSV, written
+        /// outside the run. The run itself records one event per level.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Pearson correlation of our `PatternEval` value vs Edax's evaluation
     /// on a bounded position set (Phase 9b; design doc §4.3.8
@@ -380,9 +396,11 @@ enum Command {
         /// Seed for the deterministic position walk.
         #[arg(long, default_value_t = 42)]
         seed: u64,
-        /// Output CSV (also copied into `results/<ts>/`).
-        #[arg(long, default_value = "results/eval_correlation_edax.csv")]
-        output: PathBuf,
+        /// Optional extra copy of the per-position table as a CSV, written
+        /// outside the run. The run itself records one event per sampled
+        /// position.
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// Learn the opening book via self-play + Negamax back-propagation +
     /// drawishness (Phase 8; design doc §4.3.7 / Buro 1999). Writes the
@@ -419,12 +437,11 @@ enum Command {
         output: PathBuf,
     },
     /// Run a §6 sensitivity-analysis parameter sweep (Phase 10; design
-    /// doc §6 / §5.1 / §4.2). Sweep **one** §6 parameter at a time (the §6
-    /// table is one row per parameter); each condition is run for `--runs`
-    /// independent seeded trials. Writes `results/<ts>/sweep_config.json`
-    /// (the resolved spec) + `metrics.csv` (one row per trial) and refreshes
-    /// `results/latest`. With no parameter flag it lists the sweepable
-    /// parameters and exits non-zero.
+    /// doc §6 / §5.1). Sweep **one** §6 parameter at a time (the §6 table is
+    /// one row per parameter); each condition is run for `--runs` independent
+    /// seeded trials. Recorded as a runvault sweep parent (the resolved grid)
+    /// plus one child run per condition (its trials as events). With no
+    /// parameter flag it lists the sweepable parameters and exits non-zero.
     ///
     /// Metric per parameter (see `crate::sweep`): ProbCut-T / depth-pair /
     /// multi-stages / max-depth / TT-size / endgame-empties → search node
@@ -1024,9 +1041,12 @@ fn walk_line(plies: usize, seed: u64) -> (GameState, Vec<Move>) {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let Cli {
+        command,
+        results_root,
+    } = Cli::parse();
 
-    match cli.command {
+    match command {
         Command::Play {
             black,
             white,
@@ -1149,36 +1169,79 @@ fn main() -> Result<()> {
                 result.black, result.white
             );
 
-            // §4.2 single-run output contract: a timestamped run dir with
-            // `config.json` (the resolved single condition) + `metrics.csv`
-            // (one summary row) so `show-experiment-settings` / `visualize`
-            // can consume a `run`. Best-effort (a results-dir failure must
-            // not fail the game itself).
-            if let Ok(run) = results::new_run_dir(std::path::Path::new("results")) {
-                let cfg = serde_json::json!({
-                    "command": "play",
-                    "black": black,
-                    "white": white,
-                    "depth": depth,
-                    "endgame_empties": endgame_empties,
-                    "seed": seed,
-                    "eval": eval_kind,
-                    "probcut": pc_kind,
-                    "mpc": mpc_kind,
-                    "book": book_kind,
-                });
-                let _ = std::fs::write(
-                    run.join("config.json"),
-                    serde_json::to_string_pretty(&cfg).unwrap_or_default(),
-                );
-                let plies = moves.len();
-                let metrics = format!(
-                    "black_score,white_score,winner,plies,seed\n{},{},{winner},{plies},{seed}\n",
-                    result.black, result.white
-                );
-                let _ = std::fs::write(run.join("metrics.csv"), metrics);
-                println!("results: {}", run.display());
+            // The condition is what the flags resolved to; the *contents*
+            // of the weight / model / book / MPC files decide the result
+            // just as much, and a path does not identify them — they go in
+            // as datasets, hashed.
+            let parameters = json!({
+                "black": black,
+                "white": white,
+                "depth": depth,
+                "endgame_empties": endgame_empties,
+                "seed": seed,
+                "eval": match (&glem_model, &eval_weights) {
+                    (Some(_), _) => "glem",
+                    (None, Some(_)) => "pattern",
+                    (None, None) => "basic",
+                },
+                "probcut": { "enabled": pc.enabled, "t": pc.t, "d": pc.d, "h": pc.h },
+                "mpc": {
+                    "enabled": mpc_cfg.enabled,
+                    "t_lt36": mpc_cfg.t_lt36,
+                    "t_ge36": mpc_cfg.t_ge36,
+                    "cells": mpc_cfg.cell_count(),
+                },
+                "book": book_loaded.is_some(),
+            });
+            let mut data = Vec::new();
+            if let Some(path) = &eval_weights {
+                data.push(record::learned_artifact("eval-weights", path)?);
             }
+            if let Some(path) = &glem_model {
+                data.push(record::learned_artifact("glem-model", path)?);
+            }
+            if let Some(path) = &probcut_params {
+                data.push(record::learned_artifact("probcut-params", path)?);
+            }
+            if let Some(path) = &mpc_params {
+                data.push(record::learned_artifact("mpc-params", path)?);
+            }
+            if let Some(path) = &book {
+                data.push(record::learned_artifact("opening-book", path)?);
+            }
+
+            let mut run = Run::start(
+                record::options(
+                    "play",
+                    record::DOMAIN_SIMULATION,
+                    &results_root,
+                    record::replication_play(),
+                )
+                .parameters(&parameters)
+                .context("runvault: parameters の組み立てに失敗")?
+                .seed_pointers(["/seed"])
+                .master_seed(seed)
+                .data(data),
+            )
+            .context("runvault: run の開始に失敗")?;
+
+            // `plies` counts the recorded moves (passes included), which is
+            // what the old metrics.csv column held. The terminal event's `t`
+            // counts discs placed — that is the number the 60-square budget
+            // bounds.
+            let placements = moves.iter().filter(|m| *m != "pass").count() as u64;
+            run.log_metrics(
+                "run",
+                &[
+                    ("black_score", f64::from(result.black)),
+                    ("white_score", f64::from(result.white)),
+                    ("plies", moves.len() as f64),
+                ],
+            )
+            .context("run スコープの指標の記録に失敗")?;
+            record::log_game(&mut run, "game", placements, winner, &moves.join(" "))?;
+            let dir = run.finish().context("runvault: run の終了に失敗")?;
+            println!("results: {}", dir.display());
         }
         Command::BenchSearch {
             depth,
@@ -1210,6 +1273,46 @@ fn main() -> Result<()> {
                 }
                 None => None,
             };
+            // The measurement is decided by the flags plus the *contents*
+            // of the fitted-coefficient files, so those go in hashed.
+            let parameters = json!({
+                "depth": depth,
+                "from_plies": from_plies,
+                "seed": seed,
+                "eval": if glem_model.is_some() { "glem" } else { "discdiff" },
+                "mode": if speedup { "speedup" } else { "single" },
+                "probcut": {
+                    "enabled": speedup && probcut_params.is_some()
+                        || !speedup && probcut && !no_probcut,
+                    "t": probcut_t,
+                },
+                "mpc": { "enabled": if speedup { mpc_params.is_some() } else { mpc } },
+            });
+            let mut data = Vec::new();
+            if let Some(path) = &glem_model {
+                data.push(record::learned_artifact("glem-model", path)?);
+            }
+            if let Some(path) = &probcut_params {
+                data.push(record::learned_artifact("probcut-params", path)?);
+            }
+            if let Some(path) = &mpc_params {
+                data.push(record::learned_artifact("mpc-params", path)?);
+            }
+            let mut run = Run::start(
+                record::options(
+                    "bench-search",
+                    record::DOMAIN_SIMULATION,
+                    &results_root,
+                    record::replication_bench_search(),
+                )
+                .parameters(&parameters)
+                .context("runvault: parameters の組み立てに失敗")?
+                .seed_pointers(["/seed"])
+                .master_seed(seed)
+                .data(data),
+            )
+            .context("runvault: run の開始に失敗")?;
+
             // Single closure so every call site (full / single / mpc) uses
             // the same chosen evaluator without duplicating the match.
             let bench_one = |root: &GameState,
@@ -1234,6 +1337,7 @@ fn main() -> Result<()> {
                     ProbCutConfig::default(),
                     MultiProbCutConfig::default(),
                 );
+                record::log_bench_condition(&mut run, "full", n_off, v_off)?;
                 println!("bench-search depth={depth} from_plies={from_plies} seed={seed}");
                 println!(
                     "  full  : value={v_off} nodes={n_off} time={t_off:.3}s nps={}",
@@ -1244,6 +1348,7 @@ fn main() -> Result<()> {
                 let (n_single, single_done) = if probcut_params.is_some() {
                     let pc = build_probcut(true, false, probcut_t, probcut_params.as_ref())?;
                     let (v, n, t) = bench_one(&root, depth, pc, MultiProbCutConfig::default());
+                    record::log_bench_condition(&mut run, "single", n, v)?;
                     let r = n as f64 / n_off.max(1) as f64;
                     println!(
                         "  single: value={v} nodes={n} time={t:.3}s nps={} \
@@ -1264,6 +1369,7 @@ fn main() -> Result<()> {
                 if mpc_params.is_some() {
                     let mc = build_multi_probcut(true, mpc_params.as_ref())?;
                     let (v, n, t) = bench_one(&root, depth, ProbCutConfig::default(), mc);
+                    record::log_bench_condition(&mut run, "mpc", n, v)?;
                     let r_full = n as f64 / n_off.max(1) as f64;
                     println!(
                         "  mpc   : value={v} nodes={n} time={t:.3}s nps={} \
@@ -1296,6 +1402,15 @@ fn main() -> Result<()> {
                     Some(p) => format!("glem({})", p.display()),
                     None => "discdiff".to_string(),
                 };
+                // One measurement, so it is the run's own number. Time and
+                // NPS are not recorded: `status.json`'s `duration_sec` is
+                // the record of time, and a node count is a different
+                // quantity that cannot be derived from it.
+                run.log_metrics(
+                    "run",
+                    &[("nodes", nodes as f64), ("search_value", f64::from(value))],
+                )
+                .context("run スコープの指標の記録に失敗")?;
                 println!(
                     "bench-search depth={depth} from_plies={from_plies} \
                      eval={eval_kind} probcut={pc_kind} mpc={mpc_kind} \
@@ -1303,6 +1418,8 @@ fn main() -> Result<()> {
                     nps(nodes, secs)
                 );
             }
+            let dir = run.finish().context("runvault: run の終了に失敗")?;
+            println!("results: {}", dir.display());
         }
         Command::Selfplay => {
             println!("selfplay: not yet implemented (Phase 4)");
@@ -1524,6 +1641,7 @@ fn main() -> Result<()> {
             let set = wthor_murakami::load_set(&games)
                 .map_err(|e| anyhow::anyhow!("load {}: {e}", games.display()))?;
             let mpc = build_multi_probcut(mpc_params.is_some(), mpc_params.as_ref())?;
+            let mpc_enabled = mpc.enabled;
             let cfg = phase9_engine_config(depth, endgame_empties, mpc);
             let pattern = load_pattern(eval_weights.as_ref())?;
             let book_loaded = match &book {
@@ -1546,13 +1664,65 @@ fn main() -> Result<()> {
                 all.extend(match_replay::replay_game(g, &mut eng, main_lo, main_hi)?);
             }
             let summary = match_replay::summarize(&all);
-            if let Some(p) = output.parent() {
-                std::fs::create_dir_all(p).ok();
+
+            // No RNG is drawn anywhere here: the recorded games are replayed
+            // move by move and the engine is deterministic. Hence `analysis`
+            // — `simulation` would demand a master seed nothing consumes.
+            let parameters = json!({
+                "depth": depth,
+                "endgame_empties": endgame_empties,
+                "main_lo": main_lo,
+                "main_hi": main_hi,
+                "eval": if eval_weights.is_some() { "pattern" } else { "basic" },
+                "book": book_loaded.is_some(),
+                "mpc": { "enabled": mpc_enabled },
+            });
+            let mut data = vec![record::murakami_dataset(&games, set.games.len())?];
+            if let Some(path) = &eval_weights {
+                data.push(record::learned_artifact("eval-weights", path)?);
             }
-            match_replay::write_csv(&output, &all)?;
-            // Mirror into results/<ts>/.
-            if let Ok(run) = results::new_run_dir(std::path::Path::new("results")) {
-                let _ = match_replay::write_csv(&run.join("murakami_replay.csv"), &all);
+            if let Some(path) = &book {
+                data.push(record::learned_artifact("opening-book", path)?);
+            }
+            if let Some(path) = &mpc_params {
+                data.push(record::learned_artifact("mpc-params", path)?);
+            }
+            let mut run = Run::start(
+                record::options(
+                    "match-replay",
+                    record::DOMAIN_ANALYSIS,
+                    &results_root,
+                    record::replication_match_replay(),
+                )
+                .parameters(&parameters)
+                .context("runvault: parameters の組み立てに失敗")?
+                .data(data),
+            )
+            .context("runvault: run の開始に失敗")?;
+            record::log_decisions(&mut run, &all)?;
+            run.log_metrics(
+                "run",
+                &[
+                    ("n_units", set.games.len() as f64),
+                    ("scored_decisions", f64::from(summary.total)),
+                    ("matched", f64::from(summary.matched)),
+                    ("overall_match_rate", summary.overall_rate()),
+                    ("main_decisions", f64::from(summary.main_total)),
+                    ("main_matched", f64::from(summary.main_matched)),
+                    ("main_match_rate", summary.main_rate()),
+                ],
+            )
+            .context("run スコープの指標の記録に失敗")?;
+            let dir = run.finish().context("runvault: run の終了に失敗")?;
+
+            // The run holds every decision; `--output` is an extra copy for
+            // whoever wants the flat table, and it is written outside the run
+            // so `manifest.csv` stays the one `finish()` sealed.
+            if let Some(path) = &output {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                match_replay::write_csv(path, &all)?;
             }
             let eval_kind = eval_weights.as_ref().map_or_else(
                 || "basic".to_string(),
@@ -1561,10 +1731,10 @@ fn main() -> Result<()> {
             println!(
                 "match-replay games={} engine={} depth={depth} \
                  endgame_empties={endgame_empties} main_window=[{main_lo},{main_hi}] \
-                 output={}",
+                 results={}",
                 set.games.len(),
                 eval_kind,
-                output.display()
+                dir.display()
             );
             println!(
                 "  scored_decisions={} matched={} overall_match_rate={:.4}",
@@ -1652,27 +1822,62 @@ fn main() -> Result<()> {
                 rows.push(lr);
             }
             let wall = t0.elapsed().as_secs_f64();
-            if let Some(p) = output.parent() {
-                std::fs::create_dir_all(p).ok();
+
+            // `--seed` is accepted and recorded but decides nothing here: our
+            // engine is deterministic and Edax runs single-threaded with its
+            // book off. It is kept out of `config_hash` so two runs of the
+            // same condition stay one condition, and the run is `analysis`
+            // rather than `simulation` for the same reason — no master seed.
+            let parameters = json!({
+                "edax_levels": levels,
+                "num_games_per_level": n,
+                "depth": depth,
+                "endgame_empties": endgame_empties,
+                "eval": if eval_weights.is_some() { "pattern" } else { "basic" },
+                "seed": seed,
+            });
+            let mut data = record::edax_datasets(&path, &probe.eval_file)?;
+            if let Some(p) = &eval_weights {
+                data.push(record::learned_artifact("eval-weights", p)?);
             }
-            let mut csv =
-                String::from("level,games,wins,draws,losses,score_rate,win_rate,elo_delta\n");
-            for r in &rows {
-                csv.push_str(&format!(
-                    "{},{},{},{},{},{:.6},{:.6},{:.3}\n",
-                    r.level,
-                    r.games,
-                    r.wins,
-                    r.draws,
-                    r.losses,
-                    r.score_rate(),
-                    r.win_rate(),
-                    r.elo_delta()
-                ));
-            }
-            std::fs::write(&output, &csv)?;
-            if let Ok(run) = results::new_run_dir(std::path::Path::new("results")) {
-                let _ = std::fs::write(run.join("elo_vs_edax.csv"), &csv);
+            let mut run = Run::start(
+                record::options(
+                    "elo-vs-edax",
+                    record::DOMAIN_ANALYSIS,
+                    &results_root,
+                    record::replication_elo_vs_edax(),
+                )
+                .parameters(&parameters)
+                .context("runvault: parameters の組み立てに失敗")?
+                .hash_exclude(["/seed"])
+                .data(data),
+            )
+            .context("runvault: run の開始に失敗")?;
+            record::log_edax_levels(&mut run, &rows)?;
+            run.log_metrics("run", &[("n_units", rows.len() as f64)])
+                .context("run スコープの指標の記録に失敗")?;
+            let dir = run.finish().context("runvault: run の終了に失敗")?;
+
+            if let Some(out) = &output {
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                let mut csv =
+                    String::from("level,games,wins,draws,losses,score_rate,win_rate,elo_delta\n");
+                for r in &rows {
+                    csv.push_str(&format!(
+                        "{},{},{},{},{},{:.6},{:.6},{:.3}\n",
+                        r.level,
+                        r.games,
+                        r.wins,
+                        r.draws,
+                        r.losses,
+                        r.score_rate(),
+                        r.win_rate(),
+                        r.elo_delta()
+                    ));
+                }
+                std::fs::write(out, &csv)?;
             }
             let eval_kind = eval_weights.as_ref().map_or_else(
                 || "basic".to_string(),
@@ -1680,13 +1885,13 @@ fn main() -> Result<()> {
             );
             println!(
                 "elo-vs-edax edax={} levels={:?} games_per_level={n} \
-                 engine={} depth={depth} seed={seed} wall={wall:.1}s output={} \
+                 engine={} depth={depth} seed={seed} wall={wall:.1}s results={} \
                  (BOUNDED demo — Edax level→absolute strength is qualitative; \
                  full sweep is a documented README command)",
                 path.display(),
                 levels,
                 eval_kind,
-                output.display()
+                dir.display()
             );
         }
         Command::EvalCorrelationEdax {
@@ -1752,24 +1957,61 @@ fn main() -> Result<()> {
             let xs: Vec<f64> = samples.iter().map(|s| s.our_score as f64).collect();
             let ys: Vec<f64> = samples.iter().map(|s| s.edax_score as f64).collect();
             let r = eval_corr::pearson(&xs, &ys);
-            if let Some(p) = output.parent() {
-                std::fs::create_dir_all(p).ok();
+
+            // The sampled positions come from seeded ChaCha20 walks, so the
+            // seed decides which positions are measured: `simulation`.
+            let parameters = json!({
+                "edax_level": edax_level,
+                "positions": positions,
+                "seed": seed,
+                "eval": if eval_weights.is_some() { "pattern" } else { "basic" },
+            });
+            let mut data = record::edax_datasets(&path, &probe.eval_file)?;
+            if let Some(p) = &eval_weights {
+                data.push(record::learned_artifact("eval-weights", p)?);
             }
-            eval_corr::write_csv(&output, &samples, r)?;
-            if let Ok(run) = results::new_run_dir(std::path::Path::new("results")) {
-                let _ = eval_corr::write_csv(&run.join("eval_correlation_edax.csv"), &samples, r);
+            let mut run = Run::start(
+                record::options(
+                    "eval-correlation-edax",
+                    record::DOMAIN_SIMULATION,
+                    &results_root,
+                    record::replication_eval_correlation(),
+                )
+                .parameters(&parameters)
+                .context("runvault: parameters の組み立てに失敗")?
+                .seed_pointers(["/seed"])
+                .master_seed(seed)
+                .data(data),
+            )
+            .context("runvault: run の開始に失敗")?;
+            record::log_eval_samples(&mut run, &samples)?;
+            let mut values = vec![("n_units", samples.len() as f64)];
+            // Pearson's r is undefined for n < 2 or a flat series. An
+            // undefined value is not zero, so the row is simply not written.
+            if let Some(r) = r {
+                values.push(("pearson_r", r));
+            }
+            run.log_metrics("run", &values)
+                .context("run スコープの指標の記録に失敗")?;
+            let dir = run.finish().context("runvault: run の終了に失敗")?;
+
+            if let Some(out) = &output {
+                if let Some(parent) = out.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                eval_corr::write_csv(out, &samples, r)?;
             }
             let eval_kind = eval_weights.as_ref().map_or_else(
                 || "basic".to_string(),
                 |p| format!("pattern({})", p.display()),
             );
             let edax_disp = path.display();
-            let out_disp = output.display();
+            let dir_disp = dir.display();
             let r_disp = r.map_or_else(|| "NA".to_string(), |v| format!("{v:.4}"));
             let n = samples.len();
             println!(
                 "eval-correlation-edax edax={edax_disp} level={edax_level} \
-                 engine={eval_kind} n={n} pearson_r={r_disp} output={out_disp} \
+                 engine={eval_kind} n={n} pearson_r={r_disp} results={dir_disp} \
                  (Edax as ground truth; bounded position count)"
             );
         }
@@ -1885,12 +2127,12 @@ fn main() -> Result<()> {
                 resolved.points.len(),
                 resolved.points.len() * runs as usize,
             );
-            let (run_dir, rows) = sweep::run_sweep(&resolved, std::path::Path::new("results"))?;
+            let (parent_dir, rows) = sweep::run_sweep(&resolved, &results_root)?;
             println!(
-                "wrote {} ({} rows) + {}",
-                run_dir.join("metrics.csv").display(),
+                "sweep parent: {} ({} conditions, {} trials)",
+                parent_dir.display(),
+                resolved.points.len(),
                 rows.len(),
-                run_dir.join("sweep_config.json").display(),
             );
             // A short per-condition mean of the headline metric so the run
             // is self-describing without the Python viz.

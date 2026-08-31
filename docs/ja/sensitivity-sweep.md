@@ -5,22 +5,29 @@
 `sweep` は設計ドキュメント §6 の感度分析を実行する．**1 つ**の §6
 パラメータをそのグリッド（両端含む `min/max/step`，GLEM サポートは対数
 スケール，または明示的な値リスト）に展開し，値ごとに `--runs` の独立した
-**シード付き**試行を実行し，§4.2 の出力契約を新しい
-`results/<YYYYMMDD_HHMMSS>/` へ書き出す（`results/latest` を更新）．
+**シード付き**試行を実行する．結果は runvault が
+`--results-root`（既定 `results`）の下に置く:
 
-- `sweep_config.json` — 完全に解決されたスイープ仕様．
-- `metrics.csv` — 試行ごとに 1 行: スイープパラメータ列，測定メトリクス
-  列，試行 `seed`．
+- **親 run**（サブコマンド `sweep`） — 解決済みのグリッドそのものを
+  `config.json` の `parameters` に持つ．親自身は何も測らない．
+- **条件ごとの子 run**（サブコマンド `sweep-point`） — その値を
+  `parameters` に持ち，試行 1 本を `events.jsonl` の
+  `x.logistello.trial` イベント 1 行として，条件の平均を `metrics.csv`
+  の run スコープ指標（`mean_<metric>` と `n_units`）として持つ．
+
+試行は時間軸を持たない 1 回の測定なので，1 行で言い尽くせる（子 run に
+割る必要がない）．掃引していない軸の列は書かない — 測っていない量を 0 と
+して書くと，後から «測って 0 だった» と区別できなくなる．
 
 ## 設計上の注記
 
 - **1 実行 1 軸．** §6 表はパラメータごとに 1 行である．`sweep` は
   パラメータごとに 1 回呼ぶ必要がある．パラメータフラグなしでは
   スイープ可能なパラメータを列挙し非ゼロ終了する．
-- **`metrics.csv` は実時間を含まない．** 試行ごとの RNG シードは
+- **実時間は記録しない．** 試行ごとの RNG シードは
   `--seed + condition_index*runs + trial_index` として明示的に導出
-  （実時間は使わない）するので，`metrics.csv` は反復実行で
-  バイト同一である．実時間は意図的に記録メトリクスにしない．
+  （実時間は使わない）するので，測定値は反復実行で同一である．実行時間は
+  `status.json` の `duration_sec` が正本なので指標にはしない．
 
 | パラメータ（`--flag`） | メトリクス | §6 期待方向 |
 |---|---|---|
@@ -45,30 +52,35 @@ Edax ベース条件 ≥50）．`--seed` は基底 RNG シード（既定 `42`�
 cargo run --release -p logistello-cli -- sweep \
     --endgame-empties-values 10,20 --runs 3 --seed 42
 
-uv run logistello-tools show-experiment-settings --results-dir results/latest
-uv run logistello-tools visualize-sweep --results-dir results/latest
-#   -> results/latest/figures/{sweep_<metric>.png, sweep_overview.png,
-#                              sweep_grid_animation.gif}
+# どの run を見るかは runvault が答える（--results-dir 省略時）
+uv run logistello-tools show-experiment-settings --subcommand sweep
+uv run logistello-tools visualize-sweep
+#   -> results/logistello/figures/<run_slug>/{sweep_<metric>.png,
+#      sweep_overview.png, sweep_grid_animation.gif}
 ```
 
-1 ゲームの実行も §4.2 のレイアウト（`config.json` + `metrics.csv`）を
-書き出し，`visualize` で可視化できる．
+1 ゲームの実行も run として記録されるので，`visualize` で可視化できる．
 
 ```bash
 cargo run --release -p logistello-cli -- play \
     --black engine --white random --depth 6 --seed 42
-uv run logistello-tools visualize --results-dir results/latest
+uv run logistello-tools visualize          # 最新の play run
 ```
 
 ## Python 可視化ツール
 
 | ツール | 目的 |
 |---|---|
-| `visualize --results-dir DIR` | 単一実行の可視化（`config.json` + `metrics.csv`）．既定で図は `{results_dir}/figures` |
-| `visualize-sweep --results-dir DIR` | スイープのパラメータ対メトリクス図 + 条件別グリッドアニメ（`--fps`，`--max-frames`，`--no-grid-animation`） |
-| `show-experiment-settings --results-dir DIR` | 解決済み `config.json` / `sweep_config.json` 設定を表示（`--json` で JSON） |
+| `visualize [--subcommand play]` | 単発 run の可視化（条件 + run スコープ指標） |
+| `visualize-sweep` | スイープのパラメータ対メトリクス図 + 条件別グリッドアニメ（`--fps`，`--max-frames`，`--no-grid-animation`） |
+| `show-experiment-settings [--subcommand …]` | 解決済みの条件を表示（`--json` で JSON） |
 
-`results/latest` は自動解決される．フル §6 スイープ（`--runs 30`，Edax
+`--results-dir` を省略すると `runvault path --latest` が run を解決する
+（`results/` を自分で走査しない）．図は run ディレクトリの *隣*
+（`results/logistello/figures/<run_slug>/`）に置く — `manifest.csv` は
+`finish()` が確定させたもので，後から足したものはそこに載らないためである．
+移行前の `results/<YYYYMMDD_HHMMSS>/` は `--results-dir` に直接渡せば
+従来どおり読める．フル §6 スイープ（`--runs 30`，Edax
 ≥50）は[フルスケール再現](full-scale-reproduction.md)に記載．
 
 ---

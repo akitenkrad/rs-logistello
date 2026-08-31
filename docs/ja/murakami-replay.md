@@ -46,7 +46,7 @@ cargo run --release -p logistello-cli -- murakami-extract \
 cargo run --release -p logistello-cli -- match-replay \
     --games tests/data/murakami_1997.json \
     --eval-weights results/eval_weights/wthor_medium.lgw1 \
-    --depth 8 --output results/murakami_replay.csv
+    --depth 8
 ```
 
 | フラグ | 意味 | 既定値 |
@@ -58,11 +58,20 @@ cargo run --release -p logistello-cli -- match-replay \
 | `--endgame-empties` | 厳密終盤切替閾値（空きマス; B8） | `20` |
 | `--mpc-params` | 任意の Multi-ProbCut パラメータ JSON（`probcut-fit` 出力） | — |
 | `--main-lo` / `--main-hi` | 「メイン局面」プライ窓（両端含む，設計ドキュメント §5） | `10` / `50` |
-| `--output` | 出力 CSV（`results/<ts>/` にもコピー） | `results/murakami_replay.csv` |
+| `--output` | 判断表の CSV を run の外にもう 1 部書く（任意） | — |
 
-`match-replay` は CSV をタイムスタンプ付き `results/<YYYYMMDD_HHMMSS>/`
-ディレクトリにもミラーし，`results/latest` シンボリックリンクを張る
-（設計ドキュメント §4.2）．
+実行は runvault の run として記録される（`--results-root`，既定
+`results`）．判断 1 行ずつは `events.jsonl` の `observation` イベント
+（`unit_id` = 棋譜，`t` = 手数）で，一致率などの集約は `metrics.csv` の
+run スコープ指標（`scored_decisions` / `matched` / `overall_match_rate` /
+`main_decisions` / `main_matched` / `main_match_rate` / `n_units`）である．
+ゴールド棋譜・学習重み・定石・MPC 係数は **中身のハッシュ**ごと
+`config.json` の `data` に載る — パスは条件ではないので，同じファイルなら
+置き場所が違っても同じ条件になる．
+
+この run は乱数を 1 つも引かない（棋譜を決定的に再生するだけ）ので分野は
+`analysis` である．`--output` は run の外に置く «表がほしい人のための»
+写しで，記録そのものではない．
 
 > **注意（正直な注記）:** コミット済みの簡易実行は *中規模* の WThor 学習
 > 重み（数百局コーパス，数分の学習）を使い，本番 Logistello-2 コーパス

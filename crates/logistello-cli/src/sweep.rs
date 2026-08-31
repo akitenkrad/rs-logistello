@@ -1,23 +1,23 @@
-//! Phase 10 sensitivity analysis (`sweep`) — design doc §6 / §5.1 / §4.2.
+//! Phase 10 sensitivity analysis (`sweep`) — design doc §6 / §5.1.
 //!
 //! A `sweep` resolves every requested §6 parameter grid into an explicit
 //! list of values, builds the **cross-product** of all requested grids
 //! ("conditions"), and for every `(condition × seed in 0..runs)` runs the
-//! one measurement appropriate to the parameter being swept. One CSV row is
-//! written per trial. Everything is **deterministic per `(condition, seed)`**
+//! one measurement appropriate to the parameter being swept. One trial is
+//! recorded per `(condition, seed)`. Everything is **deterministic per `(condition, seed)`**
 //! (seeds are derived explicitly from the `--seed` base + the trial index —
 //! never "current time", design-doc reproducibility requirement), so two
-//! identical invocations produce byte-identical `metrics.csv`.
+//! identical invocations produce identical measurements.
 //!
-//! ## Output contract (design doc §4.2)
+//! ## What is recorded (runvault)
 //!
-//! `results/<YYYYMMDD_HHMMSS>/` (via [`crate::results::new_run_dir`], which
-//! also refreshes `results/latest`) containing:
+//! A sweep is a **parent run plus one child run per condition**. The parent
+//! holds the resolved grid in its `parameters` and measures nothing itself;
+//! each child holds its own point of the grid, one `x.logistello.trial` event
+//! per trial, and the condition's mean of the §6 metric.
 //!
-//! - `sweep_config.json` — the fully *resolved* sweep spec (every parameter,
-//!   its resolved value list, `runs`, `seed`, the per-parameter metric).
-//! - `metrics.csv` — one row per trial: every §6 parameter column, the
-//!   measured metric columns, and the trial `seed`.
+//! A trial is an event rather than a run of its own because it has no time
+//! axis — one trial is one measurement, so it fits in one row.
 //!
 //! ## Metric per swept parameter (design doc §6 "期待される主要な知見")
 //!
@@ -39,12 +39,13 @@
 //! | `endgame_empties`    | exact-endgame switch (B8)         | `nodes`(+`dispatch`)    | larger threshold ⇒ exact endgame starts earlier ⇒ node count rises monotonically |
 //! | `drawishness`        | book drawishness blend `λ`        | `selfplay_score`        | `λ` shifts the self-play outcome |
 //!
-//! Every metric column is recorded for every row (irrelevant columns hold
-//! a deterministic neutral value) so the CSV schema is fixed regardless of
-//! which parameter is swept. **`metrics.csv` carries only deterministic
-//! columns** (the byte-identical-across-runs §6 requirement); the
-//! wall-clock `time_sec`/`nps` are kept on `MetricRow` for the stdout run
-//! summary but are intentionally absent from the CSV.
+//! Only the fields the swept axis actually measures are written to its trial
+//! events. [`MetricRow`] still carries every column (it is one fixed struct),
+//! but a column the axis never measured is a neutral zero, and writing it
+//! would claim a measurement that was never made.
+//! The wall-clock `time_sec` / `nps` are kept on [`MetricRow`] for the stdout
+//! summary and are recorded nowhere — `status.json`'s `duration_sec` is the
+//! record of time.
 
 use std::path::Path;
 
@@ -52,7 +53,11 @@ use anyhow::{Context, Result, bail};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha20Rng;
+use runvault::{Lineage, Run};
 use serde::Serialize;
+use serde_json::json;
+
+use crate::record;
 
 use logistello_book::{BookConfig, learn_book};
 use logistello_core::Zobrist;
@@ -231,7 +236,7 @@ pub enum Axis {
 }
 
 impl Axis {
-    /// The CSV / `sweep_config.json` column name for this axis.
+    /// The `parameters` / trial-event column name for this axis.
     pub fn col(self) -> &'static str {
         match self {
             Axis::ProbcutT => "probcut_t",
@@ -859,28 +864,37 @@ fn drawishness_selfplay_score(lambda: f64, seed: u64) -> i32 {
 }
 
 // ===================================================================== //
-//  Output contract (design doc §4.2)                                    //
+//  Recording (runvault: a sweep parent + one child per condition)       //
 // ===================================================================== //
 
-/// The resolved sweep spec serialised into `sweep_config.json`. Round-trips
-/// the full resolved spec (every value the sweep actually used).
+/// The parent run's `parameters`: the resolved grid itself.
+///
+/// The parent is not one measurement, so it records no metric — what it owns
+/// is the definition of the grid its children fill in.
 #[derive(Debug, Serialize)]
-pub struct SweepConfigJson {
-    pub command: &'static str,
-    pub axis: String,
+pub struct SweepParameters {
+    /// The swept §6 parameter (the axis column name).
+    pub param: String,
+    /// The metric §6 predicts that parameter should move.
     pub metric: String,
+    /// The resolved value list, in sweep order.
     pub values: Vec<String>,
+    /// Independent seeded trials per condition.
     pub runs: u32,
+    /// Base seed; the per-trial seed is derived from it.
     pub seed: u64,
+    /// Number of conditions (`values.len()`).
     pub n_conditions: usize,
+    /// Number of trials (`n_conditions × runs`).
     pub n_trials: usize,
 }
 
-impl SweepConfigJson {
+impl SweepParameters {
+    /// Reads the resolved spec off [`ResolvedSweep`].
+    #[must_use]
     pub fn from_resolved(r: &ResolvedSweep) -> Self {
         Self {
-            command: "sweep",
-            axis: r.axis.col().to_string(),
+            param: r.axis.col().to_string(),
             metric: r.axis.metric().to_string(),
             values: r.points.iter().map(|p| p.render()).collect(),
             runs: r.runs,
@@ -891,86 +905,173 @@ impl SweepConfigJson {
     }
 }
 
-/// The fixed `metrics.csv` header (one column per §6-relevant field).
+/// A child run's `parameters`: one point of the grid.
 ///
-/// **`metrics.csv` carries only deterministic columns** so the whole file
-/// is byte-identical across repeated invocations (the §6 reproducibility
-/// requirement — a sensitivity-analysis metrics file must reproduce). The
-/// wall-clock `time_sec` / `nps` are *not* in the CSV (they cannot be
-/// reproducible); they remain on [`MetricRow`] for the stdout run summary
-/// and timing observation only.
-pub const CSV_HEADER: &str = "param,value,seed,nodes,search_value,dispatch,eval_abs_err,n_features,book_positions,selfplay_score";
-
-/// Serialises one row to a CSV line matching [`CSV_HEADER`]. Every emitted
-/// column is deterministic for a fixed `(axis, value, seed)`, so two
-/// identical sweeps produce byte-identical `metrics.csv`. The float column
-/// uses a fixed precision so its text is byte-stable.
-pub fn row_to_csv(r: &MetricRow) -> String {
-    format!(
-        "{},{},{},{},{},{},{:.4},{},{},{}",
-        r.param,
-        r.value,
-        r.seed,
-        r.nodes,
-        r.search_value,
-        r.dispatch,
-        r.eval_abs_err,
-        r.n_features,
-        r.book_positions,
-        r.selfplay_score,
-    )
+/// The base seed is called `base_seed` here and `seed` in the trial events on
+/// purpose. `runvault.read.sweep_events_table` joins a child's parameters onto
+/// its events by column name, and a shared name would silently overwrite the
+/// per-trial seed with the condition's base seed.
+#[derive(Debug, Serialize)]
+pub struct PointParameters {
+    /// The swept §6 parameter (same for every child of one sweep).
+    pub param: String,
+    /// This condition's value (`d:h` for depth pairs, else a number).
+    pub value: String,
+    /// Trials run at this condition.
+    pub runs: u32,
+    /// Base seed the per-trial seeds are derived from.
+    pub base_seed: u64,
 }
 
-/// Runs the whole sweep and writes `sweep_config.json` + `metrics.csv` into
-/// a fresh `results/<ts>/` (refreshing `results/latest`). Returns the run
-/// directory and the rows (rows returned so callers/tests can assert).
+/// The metric §6 predicts the axis should move, read off a measured row.
+#[must_use]
+pub fn metric_value(axis: Axis, row: &MetricRow) -> f64 {
+    match axis.metric() {
+        "nodes" => row.nodes as f64,
+        "eval_abs_err" => row.eval_abs_err,
+        "n_features" => row.n_features as f64,
+        "book_positions" => row.book_positions as f64,
+        "selfplay_score" => f64::from(row.selfplay_score),
+        other => unreachable!("unknown sweep metric `{other}`"),
+    }
+}
+
+/// One trial as an `events.jsonl` record.
 ///
-/// Trials are ordered `(condition, seed in 0..runs)`; the per-trial RNG
-/// seed is `base_seed + condition_index*runs + seed_index` — explicit, so
-/// the whole `metrics.csv` is byte-identical across invocations (modulo the
-/// timestamped directory name).
+/// Only the fields the axis actually measured are written. [`measure`] leaves
+/// the other columns of [`MetricRow`] at a neutral zero, and writing those
+/// would turn "not measured" into "measured zero" — the old fixed-schema CSV
+/// could not tell the two apart. `dispatch` is a label (`midgame` / `endgame`),
+/// so it can only live in an event.
+fn trial_event(axis: Axis, row: &MetricRow, index: u32) -> serde_json::Value {
+    let mut event = serde_json::Map::new();
+    event.insert("unit_id".into(), json!(format!("trial-{index}")));
+    event.insert("trial_index".into(), json!(index));
+    event.insert("seed".into(), json!(row.seed));
+    match axis.metric() {
+        "nodes" => {
+            event.insert("nodes".into(), json!(row.nodes));
+            event.insert("search_value".into(), json!(row.search_value));
+            event.insert("dispatch".into(), json!(row.dispatch));
+        }
+        "eval_abs_err" => {
+            event.insert("eval_abs_err".into(), json!(row.eval_abs_err));
+        }
+        "n_features" => {
+            event.insert("n_features".into(), json!(row.n_features));
+        }
+        "book_positions" => {
+            event.insert("book_positions".into(), json!(row.book_positions));
+        }
+        "selfplay_score" => {
+            event.insert("selfplay_score".into(), json!(row.selfplay_score));
+        }
+        other => unreachable!("unknown sweep metric `{other}`"),
+    }
+    serde_json::Value::Object(event)
+}
+
+/// Runs the whole sweep, recording it as a runvault sweep parent plus one
+/// child run per condition. Returns the parent's directory and the rows (rows
+/// returned so callers/tests can assert on them).
+///
+/// Trials are ordered `(condition, seed in 0..runs)`; the per-trial RNG seed is
+/// `base_seed + condition_index*runs + seed_index` — explicit, so the measured
+/// numbers are identical across invocations.
+///
+/// A condition is one child rather than one child per trial because a trial
+/// here has no time axis: it is a single measurement, so the whole trial fits
+/// in one event row and needs no `metrics.csv` of its own.
 ///
 /// # Errors
-/// Run-directory creation or file write failure.
+/// Run creation, event or metric writing failure.
 pub fn run_sweep(
     resolved: &ResolvedSweep,
     results_root: &Path,
 ) -> Result<(std::path::PathBuf, Vec<MetricRow>)> {
-    let run_dir = crate::results::new_run_dir(results_root)
-        .with_context(|| format!("create run dir under {}", results_root.display()))?;
+    let replication = record::replication_sweep(resolved.axis.col());
+    let parameters = SweepParameters::from_resolved(resolved);
+    let parent = Run::start(
+        record::options(
+            "sweep",
+            record::DOMAIN_SIMULATION,
+            results_root,
+            replication.clone(),
+        )
+        .parameters(&parameters)
+        .context("runvault: sweep の parameters の組み立てに失敗")?
+        .seed_pointers(["/seed"])
+        .sweep_parent(),
+    )
+    .context("runvault: sweep 親 run の開始に失敗")?;
+    let sweep_id = parent
+        .sweep_id()
+        .context("runvault: sweep 親に sweep_id がありません")?
+        .to_string();
+    let parent_run_uid = parent.run_uid().to_string();
+    let parent_dir = parent.dir().to_path_buf();
 
     let mut rows = Vec::with_capacity(resolved.points.len() * resolved.runs as usize);
     for (ci, &point) in resolved.points.iter().enumerate() {
+        let point_parameters = PointParameters {
+            param: resolved.axis.col().to_string(),
+            value: point.render(),
+            runs: resolved.runs,
+            base_seed: resolved.seed,
+        };
+        let mut child = Run::start(
+            record::options(
+                "sweep-point",
+                record::DOMAIN_SIMULATION,
+                results_root,
+                replication.clone(),
+            )
+            .parameters(&point_parameters)
+            .context("runvault: 子 run の parameters の組み立てに失敗")?
+            .seed_pointers(["/base_seed"])
+            .master_seed(resolved.seed)
+            .replicate_index(0)
+            .lineage(Lineage {
+                sweep_id: Some(sweep_id.clone()),
+                parent_run_uid: Some(parent_run_uid.clone()),
+                ..Default::default()
+            }),
+        )
+        .context("runvault: 子 run の開始に失敗")?;
+
+        let mut measured: Vec<f64> = Vec::with_capacity(resolved.runs as usize);
         for si in 0..resolved.runs {
             let trial_seed = resolved
                 .seed
                 .wrapping_add(ci as u64 * resolved.runs as u64)
                 .wrapping_add(si as u64);
-            rows.push(measure(resolved.axis, point, trial_seed));
+            let row = measure(resolved.axis, point, trial_seed);
+            child
+                .log_event(record::TRIAL_EVENT, &trial_event(resolved.axis, &row, si))
+                .with_context(|| format!("trial-{si} の記録に失敗"))?;
+            measured.push(metric_value(resolved.axis, &row));
+            rows.push(row);
         }
+
+        // 条件 1 点を 1 つの値で表す指標だけを子の metrics.csv に置く．試行ごと
+        // の値は events.jsonl の担当で，こちらに降ろすと主キーが重複する．
+        let mean = measured.iter().sum::<f64>() / measured.len() as f64;
+        child
+            .log_metrics(
+                "run",
+                &[
+                    ("n_units", measured.len() as f64),
+                    (&format!("mean_{}", resolved.axis.metric()), mean),
+                ],
+            )
+            .context("子 run の指標の記録に失敗")?;
+        child.finish().context("runvault: 子 run の終了に失敗")?;
     }
 
-    // sweep_config.json (resolved spec).
-    let cfg = SweepConfigJson::from_resolved(resolved);
-    let cfg_path = run_dir.join("sweep_config.json");
-    std::fs::write(
-        &cfg_path,
-        serde_json::to_string_pretty(&cfg).context("serialise sweep_config.json")?,
-    )
-    .with_context(|| format!("write {}", cfg_path.display()))?;
-
-    // metrics.csv (one row per trial).
-    let mut buf = String::with_capacity(rows.len() * 64 + CSV_HEADER.len() + 1);
-    buf.push_str(CSV_HEADER);
-    buf.push('\n');
-    for r in &rows {
-        buf.push_str(&row_to_csv(r));
-        buf.push('\n');
-    }
-    let csv_path = run_dir.join("metrics.csv");
-    std::fs::write(&csv_path, buf).with_context(|| format!("write {}", csv_path.display()))?;
-
-    Ok((run_dir, rows))
+    parent
+        .finish()
+        .context("runvault: sweep 親 run の終了に失敗")?;
+    Ok((parent_dir, rows))
 }
 
 #[cfg(test)]
@@ -1077,7 +1178,7 @@ mod tests {
             ..Default::default()
         };
         let r = s.resolve().unwrap();
-        let cfg = SweepConfigJson::from_resolved(&r);
+        let cfg = SweepParameters::from_resolved(&r);
         assert_eq!(cfg.n_conditions, 7);
         assert_eq!(cfg.n_trials, 28); // 7 × 4 seeds
     }
@@ -1156,7 +1257,7 @@ mod tests {
     }
 
     #[test]
-    fn config_json_round_trips_resolved_spec() {
+    fn parent_parameters_round_trip_the_resolved_spec() {
         let s = SweepSpec {
             probcut_t: Some((1.0, 1.5, 0.5)),
             runs: 2,
@@ -1164,11 +1265,10 @@ mod tests {
             ..Default::default()
         };
         let r = s.resolve().unwrap();
-        let cfg = SweepConfigJson::from_resolved(&r);
-        let json = serde_json::to_string(&cfg).unwrap();
-        let back: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(back["command"], "sweep");
-        assert_eq!(back["axis"], "probcut_t");
+        let cfg = SweepParameters::from_resolved(&r);
+        let back: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back["param"], "probcut_t");
         assert_eq!(back["metric"], "nodes");
         assert_eq!(back["values"], serde_json::json!(["1", "1.5"]));
         assert_eq!(back["runs"], 2);
@@ -1176,13 +1276,26 @@ mod tests {
     }
 
     #[test]
-    fn csv_header_matches_row_arity() {
-        let row = measure(Axis::Drawishness, Point::F(0.0), 1);
-        let line = row_to_csv(&row);
-        assert_eq!(
-            CSV_HEADER.split(',').count(),
-            line.split(',').count(),
-            "header column count must match a serialised row"
-        );
+    fn a_trial_event_only_carries_what_the_axis_measured() {
+        // The unmeasured columns of `MetricRow` are a neutral zero, and a
+        // zero written as if it were measured cannot be told from a real
+        // measurement afterwards.
+        let row = measure(Axis::BookDepth, Point::I(4), 1);
+        let event = trial_event(Axis::BookDepth, &row, 2);
+        assert_eq!(event["unit_id"], "trial-2");
+        assert_eq!(event["seed"], 1);
+        assert!(event["book_positions"].is_u64(), "the measured column");
+        for absent in [
+            "nodes",
+            "search_value",
+            "dispatch",
+            "eval_abs_err",
+            "n_features",
+        ] {
+            assert!(
+                event.get(absent).is_none(),
+                "`{absent}` was never measured on this axis"
+            );
+        }
     }
 }

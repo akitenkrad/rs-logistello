@@ -31,8 +31,7 @@ uv run logistello-tools train-eval \
 cargo run --release -p logistello-cli -- match-replay \
     --games tests/data/murakami_1997.json \
     --eval-weights results/eval_weights/wthor_full.lgw1 \
-    --depth 12 --mpc-params results/mpc_params.json \
-    --output results/murakami_replay.csv
+    --depth 12 --mpc-params results/mpc_params.json
 ```
 
 ## Edax 比フル Elo スイープ
@@ -45,7 +44,7 @@ cargo run --release -p logistello-cli -- elo-vs-edax \
     --edax-path .edax/edax --edax-levels 5,10,15,20 \
     --num-games-per-level 30 \
     --eval-weights results/eval_weights/wthor_full.lgw1 \
-    --depth 12 --output results/elo_vs_edax.csv
+    --depth 12
 ```
 
 ## フル §6 感度スイープ
@@ -85,7 +84,7 @@ cargo run --release -p logistello-cli -- sweep \
 
 # Edax ベース条件は --runs 50 を使う（設計ドキュメント §6 の統計的信頼性
 # 要件）．Edax 対エンジンのスイープメトリクスが配線されたら．
-uv run logistello-tools visualize-sweep --results-dir results/latest
+uv run logistello-tools visualize-sweep
 ```
 
 ---

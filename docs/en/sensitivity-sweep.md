@@ -4,23 +4,32 @@
 
 `sweep` runs the design-doc §6 sensitivity analysis: it expands **one** §6
 parameter into its grid (inclusive `min/max/step`, log-scale for GLEM
-support, or an explicit value list), runs `--runs` independent **seeded**
-trials per value, and writes the §4.2 output contract into a fresh
-`results/<YYYYMMDD_HHMMSS>/` (refreshing `results/latest`):
+support, or an explicit value list) and runs `--runs` independent **seeded**
+trials per value. runvault places the result under `--results-root`
+(default `results`):
 
-- `sweep_config.json` — the fully resolved sweep spec.
-- `metrics.csv` — one row per trial: the swept parameter column, the
-  measured-metric columns, and the trial `seed`.
+- a **parent run** (subcommand `sweep`) whose `config.json` `parameters`
+  hold the resolved grid itself. The parent measures nothing.
+- one **child run per condition** (subcommand `sweep-point`) whose
+  `parameters` hold that value, whose `events.jsonl` holds one
+  `x.logistello.trial` line per trial, and whose `metrics.csv` holds the
+  condition's mean as a run-scope metric (`mean_<metric>`, `n_units`).
+
+A trial is one measurement with no time axis, so it fits in a single line
+and needs no run of its own. Columns the swept axis does not measure are
+not written: a zero written for an unmeasured quantity cannot afterwards be
+told from a measurement that came out zero.
 
 ## Design notes
 
 - **One axis per run.** The §6 table is one row per parameter; `sweep` must
   be invoked once per parameter. With no parameter flag it lists the
   sweepable parameters and exits non-zero.
-- **`metrics.csv` excludes wall-clock.** The per-trial RNG seed is derived
+- **Wall time is not recorded.** The per-trial RNG seed is derived
   explicitly as `--seed + condition_index*runs + trial_index` (never
-  wall-clock), so `metrics.csv` is byte-identical across repeated
-  invocations — wall time is deliberately not a recorded metric.
+  wall-clock), so the measurements are identical across repeated
+  invocations. Elapsed time is `status.json`'s `duration_sec`, not a
+  metric.
 
 | Parameter (`--flag`) | Metric | §6-expected direction |
 |---|---|---|
@@ -45,31 +54,36 @@ Edax-based conditions ≥50). `--seed` is the base RNG seed (default `42`).
 cargo run --release -p logistello-cli -- sweep \
     --endgame-empties-values 10,20 --runs 3 --seed 42
 
-uv run logistello-tools show-experiment-settings --results-dir results/latest
-uv run logistello-tools visualize-sweep --results-dir results/latest
-#   -> results/latest/figures/{sweep_<metric>.png, sweep_overview.png,
-#                              sweep_grid_animation.gif}
+# Which run to read is runvault's answer when --results-dir is omitted
+uv run logistello-tools show-experiment-settings --subcommand sweep
+uv run logistello-tools visualize-sweep
+#   -> results/logistello/figures/<run_slug>/{sweep_<metric>.png,
+#      sweep_overview.png, sweep_grid_animation.gif}
 ```
 
-A single full game also writes the §4.2 run layout (`config.json` +
-`metrics.csv`) consumable by `visualize`:
+A single full game is recorded as a run too, and `visualize` reads it:
 
 ```bash
 cargo run --release -p logistello-cli -- play \
     --black engine --white random --depth 6 --seed 42
-uv run logistello-tools visualize --results-dir results/latest
+uv run logistello-tools visualize          # the latest play run
 ```
 
 ## Python visualisation tools
 
 | Tool | Purpose |
 |---|---|
-| `visualize --results-dir DIR` | Visualise a single run (`config.json` + `metrics.csv`); figures to `{results_dir}/figures` by default |
-| `visualize-sweep --results-dir DIR` | Sweep parameter-vs-metric figures + per-condition grid animation (`--fps`, `--max-frames`, `--no-grid-animation`) |
-| `show-experiment-settings --results-dir DIR` | Print the resolved `config.json` / `sweep_config.json` settings (`--json` for JSON) |
+| `visualize [--subcommand play]` | Visualise one run (its conditions and run-scope metrics) |
+| `visualize-sweep` | Sweep parameter-vs-metric figures + per-condition grid animation (`--fps`, `--max-frames`, `--no-grid-animation`) |
+| `show-experiment-settings [--subcommand …]` | Print the resolved conditions (`--json` for JSON) |
 
-`results/latest` is resolved automatically. The full §6 sweep (`--runs 30`,
-Edax ≥50) is documented in
+Omit `--results-dir` and `runvault path --latest` resolves the run; nothing
+scans `results/` looking for the newest-looking directory. Figures are
+written *beside* the run (`results/logistello/figures/<run_slug>/`), because
+`manifest.csv` is settled by `finish()` and anything added afterwards would
+not be in it. A pre-migration `results/<YYYYMMDD_HHMMSS>/` still reads if
+passed to `--results-dir` directly. The full §6 sweep (`--runs 30`, Edax
+≥50) is documented in
 [full-scale reproduction](full-scale-reproduction.md).
 
 ---

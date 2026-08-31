@@ -41,8 +41,7 @@ Elo を推定する（設計ドキュメント §4.3.8 `elo_vs_edax_level_N`）�
 ```bash
 cargo run --release -p logistello-cli -- elo-vs-edax \
     --edax-levels 1,3 --num-games-per-level 2 \
-    --eval-weights results/eval_weights/wthor_medium.lgw1 \
-    --output results/elo_vs_edax.csv
+    --eval-weights results/eval_weights/wthor_medium.lgw1
 ```
 
 | フラグ | 意味 | 既定値 |
@@ -53,8 +52,21 @@ cargo run --release -p logistello-cli -- elo-vs-edax \
 | `--eval-weights` | 本エンジン `PatternEval` の `LGW1` 重み（なければ `BasicEval`） | — |
 | `--depth` | 本エンジンの選択的中盤深さ（デモ用に小さく） | `6` |
 | `--endgame-empties` | 本エンジンの厳密終盤切替閾値（空きマス） | `16` |
-| `--seed` | 決定性シード（記録される） | `42` |
-| `--output` | 出力 CSV（`results/<ts>/` にもコピー） | `results/elo_vs_edax.csv` |
+| `--seed` | 記録されるが結果は決めない（下記） | `42` |
+| `--output` | レベル別表の CSV を run の外にもう 1 部書く（任意） | — |
+
+実行は runvault の run として記録される．レベル 1 つが
+`x.logistello.edax_level` イベント 1 行（旧 `elo_vs_edax.csv` の 1 行に
+対応: `games` / `wins` / `draws` / `losses` / `score_rate` / `win_rate` /
+`elo_delta`）で，`metrics.csv` には観測主体の数 `n_units`（= レベル数）
+だけを置く．Edax はバイナリと評価重み `eval.dat` の **両方**を内容
+ハッシュで `data` に載せる — どちらが違っても出る数が変わるためである．
+
+`--seed` は受け取って記録するが**何も決めない**（本エンジンは決定的で，
+Edax は book 無効・単スレッドで動かす）．そのため `config_hash` からは
+外してあり（同じ条件の run が 2 つの条件に割れないように），分野も
+`simulation` ではなく `analysis` である（駆動しない `master_seed` を
+名乗らない）．
 
 ## `eval-correlation-edax` — 本評価と Edax の相関
 
@@ -65,8 +77,7 @@ cargo run --release -p logistello-cli -- elo-vs-edax \
 ```bash
 cargo run --release -p logistello-cli -- eval-correlation-edax \
     --edax-level 6 --positions 24 \
-    --eval-weights results/eval_weights/wthor_medium.lgw1 \
-    --output results/eval_correlation_edax.csv
+    --eval-weights results/eval_weights/wthor_medium.lgw1
 ```
 
 | フラグ | 意味 | 既定値 |
@@ -76,7 +87,13 @@ cargo run --release -p logistello-cli -- eval-correlation-edax \
 | `--eval-weights` | 本 `PatternEval` の `LGW1` 重み（なければ `BasicEval`） | — |
 | `--positions` | サンプル局面数（限定） | `24` |
 | `--seed` | 決定的局面ウォークのシード | `42` |
-| `--output` | 出力 CSV（`results/<ts>/` にもコピー） | `results/eval_correlation_edax.csv` |
+| `--output` | 標本表の CSV を run の外にもう 1 部書く（任意） | — |
+
+標本 1 局面が `x.logistello.eval_sample` イベント 1 行（`our_score` /
+`edax_score`），Pearson の `r` と標本数 `n_units` が run スコープ指標で
+ある．`r` は `n < 2` や分散 0 では**定義できない**ので，その場合は行を
+書かない（0 で埋めない）．標本局面は種つきのランダムウォークで選ぶので，
+こちらの分野は `simulation`（`master_seed` = `--seed`）である．
 
 > **注意（正直な注記）:** コミット済みの簡易実行は *中規模* の WThor 学習
 > 重みを使うため，Elo は §5 ／歴史的目標より弱い．

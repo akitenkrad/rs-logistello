@@ -79,7 +79,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     subparsers.add_parser(
         "show-experiment-settings",
-        help="実行結果ディレクトリの設定値を表示 (config.json / sweep_config.json)",
+        help="run の条件を表示 (runvault の run / 移行前の results ディレクトリ)",
         add_help=False,
     )
 

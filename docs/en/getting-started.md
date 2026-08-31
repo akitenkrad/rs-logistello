@@ -54,10 +54,37 @@ cargo run --release -p logistello-cli -- play \
 
 Without `--eval-weights`, `play` uses the built-in `BasicEval` (disc count +
 mobility); with it, the engine uses the learned Edax-style `PatternEval`. A
-single full game also writes the design-doc §4.2 single-run layout
-(`config.json` + `metrics.csv`) into a fresh `results/<YYYYMMDD_HHMMSS>/`
-(refreshing `results/latest`), consumable by `visualize` (see
-[sensitivity sweep](sensitivity-sweep.md)).
+single full game is recorded as a runvault run and can be visualised with
+`visualize` (see [sensitivity sweep](sensitivity-sweep.md)).
+
+## What a run records (runvault)
+
+The subcommands that **measure** something (`play`, `bench-search`,
+`match-replay`, `elo-vs-edax`, `eval-correlation-edax`, `sweep`) record the
+invocation into a [runvault](https://github.com/akitenkrad/rs-runvault) run
+directory, `<results-root>/logistello/<run-slug>/`. runvault owns the
+placement and the naming, so nothing here creates a timestamped directory or
+a `latest` link. `--results-root` (default `results`) is a global flag.
+
+| File | What it holds |
+|---|---|
+| `run.json` | experiment, subcommand, domain, seed, lineage, the paper being reproduced |
+| `config.json` | the conditions (`parameters`) and the content hashes of the files that decide the result (`data`) |
+| `metrics.csv` | numbers: the quantities that describe the whole run with one value each (long form) |
+| `events.jsonl` | the rows that cannot be metrics — observations identified by a series, and labels such as an outcome |
+| `status.json` | state and elapsed time (`duration_sec`, the record of time) |
+
+The subcommands that only **produce data or an artefact** (`extract`,
+`glem-extract`, `probcut-fit`, `murakami-extract`, `learn-book`, `perft`)
+create no run. What they write is an input to a later run, and that run
+carries it in `config.json`'s `data` by content hash — because the contents,
+not the path, decide the result.
+
+```bash
+# Read a run's conditions / draw its figures (latest run when --results-dir is omitted)
+uv run logistello-tools show-experiment-settings
+uv run logistello-tools visualize
+```
 
 ## `bench-search` — search benchmark
 

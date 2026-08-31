@@ -32,8 +32,7 @@ With the production-scale weights (+ optional Multi-ProbCut params from
 cargo run --release -p logistello-cli -- match-replay \
     --games tests/data/murakami_1997.json \
     --eval-weights results/eval_weights/wthor_full.lgw1 \
-    --depth 12 --mpc-params results/mpc_params.json \
-    --output results/murakami_replay.csv
+    --depth 12 --mpc-params results/mpc_params.json
 ```
 
 ## Full Elo sweep vs Edax
@@ -46,7 +45,7 @@ cargo run --release -p logistello-cli -- elo-vs-edax \
     --edax-path .edax/edax --edax-levels 5,10,15,20 \
     --num-games-per-level 30 \
     --eval-weights results/eval_weights/wthor_full.lgw1 \
-    --depth 12 --output results/elo_vs_edax.csv
+    --depth 12
 ```
 
 ## Full §6 sensitivity sweeps
@@ -87,7 +86,7 @@ cargo run --release -p logistello-cli -- sweep \
 
 # Edax-based conditions use --runs 50 (design-doc §6 statistical-confidence
 # requirement) once an Edax-vs-engine sweep metric is wired.
-uv run logistello-tools visualize-sweep --results-dir results/latest
+uv run logistello-tools visualize-sweep
 ```
 
 ---
