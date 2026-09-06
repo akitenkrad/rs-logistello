@@ -123,6 +123,28 @@ pub fn replay_game<E: ReplayEngine>(
     lo: u32,
     hi: u32,
 ) -> Result<Vec<ReplayRow>> {
+    replay_game_observed(game, engine, lo, hi, |_| {})
+}
+
+/// The same rows, calling `on_decision` once for every scored Logistello
+/// decision — the point at which the engine has searched the position.
+///
+/// A decision is two full searches (`pick` then `score`), which at the
+/// documented `--depth 12` is where the time is; the *game* is far too coarse
+/// a unit for a six-game set. The number of decisions is not known before the
+/// replay, because a game stops at the first unparsable or illegal recorded
+/// move, so a caller counts them in an *unbounded* stage.
+///
+/// # Errors
+///
+/// Only propagates a hard engine failure ([`ReplayEngine::pick`] erroring).
+pub fn replay_game_observed<E: ReplayEngine>(
+    game: &MurakamiGame,
+    engine: &mut E,
+    lo: u32,
+    hi: u32,
+    mut on_decision: impl FnMut(u32),
+) -> Result<Vec<ReplayRow>> {
     engine.reset();
     let logi_color = if game.logistello_is_black {
         Color::Black
@@ -156,6 +178,7 @@ pub fn replay_game<E: ReplayEngine>(
                 if state.side_to_move == logi_color {
                     let our = engine.pick(&state)?;
                     let sc = engine.score(&state);
+                    on_decision(ply);
                     let is_main = ply >= lo && ply <= hi;
                     rows.push(ReplayRow {
                         game: game.wtb_index,

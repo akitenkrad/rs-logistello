@@ -59,7 +59,7 @@ use serde_json::json;
 
 use crate::record;
 
-use logistello_book::{BookConfig, learn_book};
+use logistello_book::{BookConfig, learn_book_observed};
 use logistello_core::Zobrist;
 use logistello_eval::{BasicEval, DiscDiffEval, LeafEvaluator};
 use logistello_search::alphabeta::{INF, SearchConfig, SearchContext, negascout};
@@ -235,7 +235,24 @@ pub enum Axis {
     Drawishness,
 }
 
+/// Self-play games one trial of a book-learning axis plays.
+///
+/// Both `Axis::BookDepth` and `Axis::Drawishness` build an opening book per
+/// trial, and this is the `num_games` they build it with. It is a constant so
+/// that the stage's denominator comes from the same number the loop uses.
+pub const BOOK_GAMES_PER_TRIAL: u32 = 6;
+
 impl Axis {
+    /// Whether one trial of this axis is a `learn_book` call.
+    ///
+    /// Those trials are the only ones that can run for minutes — a book game
+    /// at `--book-depth-values 30` is minutes on its own — so they are the
+    /// ones counted by the game rather than by the trial.
+    #[must_use]
+    pub fn learns_a_book(self) -> bool {
+        matches!(self, Axis::BookDepth | Axis::Drawishness)
+    }
+
     /// The `parameters` / trial-event column name for this axis.
     pub fn col(self) -> &'static str {
         match self {
@@ -582,6 +599,21 @@ fn bench<E: LeafEvaluator>(
 /// `time_sec`/`nps` (excluded from the determinism contract; the
 /// determinism test compares the *deterministic* columns).
 pub fn measure(axis: Axis, point: Point, seed: u64) -> MetricRow {
+    measure_observed(axis, point, seed, &mut || {})
+}
+
+/// The same measurement, calling `on_book_game` once per self-play game when
+/// the axis is one that learns a book ([`Axis::learns_a_book`]).
+///
+/// Every other axis is a search or a closed-form count and finishes in seconds
+/// (4.8s for the slowest measured, `--max-depth-values 14`), so for those the
+/// trial is a fine unit and this never fires.
+pub fn measure_observed(
+    axis: Axis,
+    point: Point,
+    seed: u64,
+    on_book_game: &mut impl FnMut(),
+) -> MetricRow {
     // A seeded mid/late-game root; the walk depth keeps it cheap yet past
     // the opening so ProbCut / endgame routing are exercised.
     let row_seed = seed;
@@ -699,14 +731,14 @@ pub fn measure(axis: Axis, point: Point, seed: u64) -> MetricRow {
                 24
             };
             let cfg = BookConfig {
-                num_games: 6,
+                num_games: BOOK_GAMES_PER_TRIAL,
                 depth_limit: depth,
                 drawishness: 0.0,
                 seed: seed.wrapping_add(1),
                 max_book_plies: 12,
                 endgame_empties: 30,
             };
-            let book = learn_book(&BasicEval::default(), &cfg);
+            let book = learn_book_observed(&BasicEval::default(), &cfg, |_| on_book_game(), || {});
             row.book_positions = book.len() as u64;
         }
         Axis::EndgameEmpties => {
@@ -748,7 +780,8 @@ pub fn measure(axis: Axis, point: Point, seed: u64) -> MetricRow {
             } else {
                 0.3
             };
-            row.selfplay_score = drawishness_selfplay_score(lambda, seed.wrapping_add(1));
+            row.selfplay_score =
+                drawishness_selfplay_score(lambda, seed.wrapping_add(1), on_book_game);
         }
     }
     row
@@ -834,16 +867,16 @@ fn glem_feature_count(max_order: u32, support: f64) -> u64 {
 
 /// Deterministic short self-play with a drawishness-`λ` book; returns the
 /// final side-to-move disc differential. Pure (seeded) and reproducible.
-fn drawishness_selfplay_score(lambda: f64, seed: u64) -> i32 {
+fn drawishness_selfplay_score(lambda: f64, seed: u64, on_book_game: &mut impl FnMut()) -> i32 {
     let cfg = BookConfig {
-        num_games: 6,
+        num_games: BOOK_GAMES_PER_TRIAL,
         depth_limit: 4,
         drawishness: lambda,
         seed,
         max_book_plies: 10,
         endgame_empties: 30,
     };
-    let book = learn_book(&BasicEval::default(), &cfg);
+    let book = learn_book_observed(&BasicEval::default(), &cfg, |_| on_book_game(), || {});
     // Deterministic playout: at each step prefer the booked move, else the
     // first legal move. No RNG ⇒ fully reproducible.
     let mut s = GameState::standard_8x8();
@@ -1039,19 +1072,63 @@ pub fn run_sweep(
         )
         .context("runvault: 子 run の開始に失敗")?;
 
+        // One stage per condition, named after the value that varies, rather
+        // than one stage over every trial of the sweep. Within a condition
+        // the trials differ only in their seed and so cost the same, which is
+        // an estimate worth having; across conditions they do not — a
+        // `--max-depth-values` trial is 0.1s at 6 and 4.8s at 14, and a
+        // `--book-depth-values` trial is minutes at 30 — and one lumped count
+        // would read the cheap condition's rate onto the expensive one.
+        // Splitting also says which condition is running, which a single
+        // count could not.
+        //
+        // The unit inside a condition is the trial, except on the two axes
+        // whose trial *is* a `learn_book` call: a book game at
+        // `--book-depth-values 30` is minutes on its own, so there the unit
+        // drops to the self-play game and the denominator is
+        // `runs * BOOK_GAMES_PER_TRIAL` — the same number the book is built
+        // with, not a guess. Either way the total is exact: no trial is
+        // skipped and nothing stops the sweep early, so the stage is bounded
+        // and closes at 100%. The number of conditions comes from the
+        // resolved value list's own length, never from dividing a range — a
+        // float step like 0.05 is not exact in binary, which is why
+        // `expand_range` counts.
+        let by_game = resolved.axis.learns_a_book();
+        let per_trial = if by_game {
+            BOOK_GAMES_PER_TRIAL as usize
+        } else {
+            1
+        };
+        let mut trials = child.stage(
+            &format!(
+                "{} {}={}",
+                if by_game { "games" } else { "trials" },
+                resolved.axis.col(),
+                point.render()
+            ),
+            resolved.runs as usize * per_trial,
+        );
+
         let mut measured: Vec<f64> = Vec::with_capacity(resolved.runs as usize);
         for si in 0..resolved.runs {
             let trial_seed = resolved
                 .seed
                 .wrapping_add(ci as u64 * resolved.runs as u64)
                 .wrapping_add(si as u64);
-            let row = measure(resolved.axis, point, trial_seed);
+            let row = if by_game {
+                measure_observed(resolved.axis, point, trial_seed, &mut || trials.tick())
+            } else {
+                let row = measure(resolved.axis, point, trial_seed);
+                trials.tick();
+                row
+            };
             child
                 .log_event(record::TRIAL_EVENT, &trial_event(resolved.axis, &row, si))
                 .with_context(|| format!("trial-{si} の記録に失敗"))?;
             measured.push(metric_value(resolved.axis, &row));
             rows.push(row);
         }
+        trials.close();
 
         // 条件 1 点を 1 つの値で表す指標だけを子の metrics.csv に置く．試行ごと
         // の値は events.jsonl の担当で，こちらに降ろすと主キーが重複する．

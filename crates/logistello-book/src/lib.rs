@@ -16,5 +16,5 @@ pub use drawishness::{SCORE_BOUND, clamp_lambda, score, trap};
 pub use learner::{
     BOOK_MAGIC, BOOK_VERSION, BookConfig, BookEntry, DEFAULT_BOOK_ENDGAME_EMPTIES,
     DEFAULT_MAX_BOOK_PLIES, EXPLORE_MARGIN, EXPLORE_PLIES, OpeningBook, apply_drawishness,
-    learn_book, negamax_backpropagate,
+    learn_book, learn_book_observed, negamax_backpropagate,
 };

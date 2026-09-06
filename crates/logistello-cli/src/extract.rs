@@ -127,6 +127,23 @@ fn black_terminal_diff(end: &GameState) -> i32 {
 ///
 /// Propagates engine errors.
 pub fn extract_selfplay(n: usize, seed: u64, max_empties_skip: Option<u32>) -> Result<Vec<Record>> {
+    extract_selfplay_observed(n, seed, max_empties_skip, |_| {})
+}
+
+/// The same records, calling `on_game` once for every self-play game played.
+///
+/// The loop is `0..n` with no early exit, so `n` is the real total and a caller
+/// can open a **bounded** stage of it.
+///
+/// # Errors
+///
+/// Propagates engine errors.
+pub fn extract_selfplay_observed(
+    n: usize,
+    seed: u64,
+    max_empties_skip: Option<u32>,
+    mut on_game: impl FnMut(usize),
+) -> Result<Vec<Record>> {
     let tables = PackTables::build();
     let mut out = Vec::new();
     for g in 0..n {
@@ -158,6 +175,9 @@ pub fn extract_selfplay(n: usize, seed: u64, max_empties_skip: Option<u32>) -> R
             }
             out.push(record_for(s, &tables, diff));
         }
+        // Outside the position loop, whose `continue`s skip a *position* and
+        // never a game: the count is of games played.
+        on_game(g);
     }
     Ok(out)
 }
@@ -259,6 +279,25 @@ pub fn extract_wthor(
     max_games: Option<usize>,
     max_empties_skip: Option<u32>,
 ) -> Result<Vec<Record>> {
+    extract_wthor_observed(dir, max_games, max_empties_skip, |_| {})
+}
+
+/// The same records, calling `on_game` once for every WThor game replayed.
+///
+/// `max_games` is a **ceiling and not a total**: the loop also ends when the
+/// `.wtb` files run out, which is the usual case for the documented
+/// `--games 1000000`. A caller therefore counts games in an *unbounded* stage
+/// rather than inventing a denominator the run may never reach.
+///
+/// # Errors
+///
+/// Returns an error if `dir` has no `.wtb` file or a record fails to replay.
+pub fn extract_wthor_observed(
+    dir: &Path,
+    max_games: Option<usize>,
+    max_empties_skip: Option<u32>,
+    mut on_game: impl FnMut(usize),
+) -> Result<Vec<Record>> {
     let tables = PackTables::build();
     let mut wtb_files: Vec<_> = std::fs::read_dir(dir)
         .with_context(|| format!("reading WTHOR dir {}", dir.display()))?
@@ -293,6 +332,7 @@ pub fn extract_wthor(
                 out.push(record_for(s, &tables, diff));
             }
             games_done += 1;
+            on_game(games_done);
             if let Some(mg) = max_games
                 && games_done >= mg
             {

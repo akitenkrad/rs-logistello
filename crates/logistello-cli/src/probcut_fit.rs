@@ -160,12 +160,22 @@ pub enum Source {
     },
 }
 
-/// Collects up to `max_samples` non-terminal positions from the corpus.
+/// Collects up to `max_samples` non-terminal positions from the corpus,
+/// calling `on_game` once per corpus game consumed.
 ///
 /// Self-play reuses the exact deterministic seeding of the Phase-4b
 /// extractor; WTHOR replays each `.wtb` game (passes auto-inserted by the
 /// reader, design doc §4.5 B6). Positions are taken in game order.
-fn collect_positions(src: &Source, max_samples: usize) -> Result<Vec<GameState>> {
+///
+/// Both arms stop as soon as `max_samples` positions are in hand, and the
+/// WThor arm also stops when the `.wtb` files run out, so neither `games` nor
+/// `max_games` is a total the collection is bound to reach: this is counted in
+/// an *unbounded* stage.
+fn collect_positions_observed(
+    src: &Source,
+    max_samples: usize,
+    mut on_game: impl FnMut(usize),
+) -> Result<Vec<GameState>> {
     let mut out = Vec::new();
     match src {
         Source::Selfplay { games, seed } => {
@@ -193,6 +203,7 @@ fn collect_positions(src: &Source, max_samples: usize) -> Result<Vec<GameState>>
                         break;
                     }
                 }
+                on_game(g);
             }
         }
         Source::Wthor { dir, max_games } => {
@@ -235,6 +246,7 @@ fn collect_positions(src: &Source, max_samples: usize) -> Result<Vec<GameState>>
                         }
                     }
                     games_done += 1;
+                    on_game(games_done);
                     if games_done >= *max_games {
                         break 'outer;
                     }
@@ -267,13 +279,30 @@ fn search_value<E: LeafEvaluator>(s: &GameState, depth: u32, eval: &E) -> i32 {
     negascout(&mut ctx, s, -INF, INF, depth, 0)
 }
 
-/// Runs the single-pair `(d, h)` fit over the corpus with `eval`.
-fn fit_with<E: LeafEvaluator>(positions: &[GameState], d: u32, h: u32, eval: &E) -> FitResult {
+/// Runs the single-pair `(d, h)` fit over the corpus with `eval`, calling
+/// `on_position` once per corpus position.
+///
+/// Every position is searched twice — once at `d` and once at `h` — so the
+/// positions cost the same to within their own branching and the corpus is
+/// counted, not weighted. `positions.len()` is exact: the loop skips a
+/// terminal position but still counts it as tried.
+fn fit_with_observed<E: LeafEvaluator>(
+    positions: &[GameState],
+    d: u32,
+    h: u32,
+    eval: &E,
+    mut on_position: impl FnMut(usize, usize),
+) -> FitResult {
     let mut lt_x = Vec::new();
     let mut lt_y = Vec::new();
     let mut ge_x = Vec::new();
     let mut ge_y = Vec::new();
-    for s in positions {
+    for (i, s) in positions.iter().enumerate() {
+        // A position skipped for being terminal was still tried, so it ticks
+        // before the `continue` rather than after it. The corpus size travels
+        // with the index: it is not known until the collection has finished,
+        // and it is the fit stage's denominator.
+        on_position(i, positions.len());
         if s.is_terminal() {
             continue;
         }
@@ -313,7 +342,44 @@ pub fn run_fit(
     t: f64,
     output: &Path,
 ) -> Result<FitResult> {
-    let positions = collect_positions(src, samples)?;
+    run_fit_observed(
+        d,
+        h,
+        src,
+        samples,
+        eval_weights,
+        t,
+        output,
+        |_| {},
+        |_, _| {},
+    )
+}
+
+/// [`run_fit`], reporting its two phases separately.
+///
+/// `on_game` fires once per corpus game collected and `on_position` once per
+/// position fitted. They are separate because the phases are: collecting the
+/// corpus replays games and copies boards, while the fit searches every
+/// position twice, and one of the two dominates by orders of magnitude
+/// depending on `(d, h)` — a single count over both would extrapolate the
+/// first phase's rate onto the second.
+///
+/// # Errors
+///
+/// Propagates corpus / I/O errors.
+#[allow(clippy::too_many_arguments)]
+pub fn run_fit_observed(
+    d: u32,
+    h: u32,
+    src: &Source,
+    samples: usize,
+    eval_weights: Option<&Path>,
+    t: f64,
+    output: &Path,
+    on_game: impl FnMut(usize),
+    on_position: impl FnMut(usize, usize),
+) -> Result<FitResult> {
+    let positions = collect_positions_observed(src, samples, on_game)?;
     if positions.is_empty() {
         bail!("no positions collected from the corpus");
     }
@@ -321,9 +387,9 @@ pub fn run_fit(
         Some(p) => {
             let w =
                 EvalWeights::load(p).map_err(|e| anyhow::anyhow!("load {}: {e}", p.display()))?;
-            fit_with(&positions, d, h, &PatternEval::new(w))
+            fit_with_observed(&positions, d, h, &PatternEval::new(w), on_position)
         }
-        None => fit_with(&positions, d, h, &BasicEval::default()),
+        None => fit_with_observed(&positions, d, h, &BasicEval::default(), on_position),
     };
     result.to_config(t).save_json(output)?;
     Ok(result)
@@ -418,16 +484,26 @@ pub fn parse_mpc_cascade(spec: &str) -> Result<Vec<(u32, u32, Option<u32>)>> {
 /// `(phase_idx, h, d)` → the accumulated `(v_d, v_h)` regression samples.
 type CellSamples = std::collections::BTreeMap<(u8, u32, u32), (Vec<f64>, Vec<f64>)>;
 
-fn fit_mpc_with<E: LeafEvaluator>(
+/// Fits every `(phase, h, d)` cascade cell with `eval` (see above), calling
+/// `on_position` once per corpus position.
+///
+/// The cascade's cells search to depths that differ by orders of magnitude,
+/// but every position pays for *all* of them — the depths are the inner loop —
+/// so the outer unit is even and the stage counts positions instead of
+/// weighting cells.
+fn fit_mpc_with_observed<E: LeafEvaluator>(
     positions: &[GameState],
     cascade: &[(u32, u32, Option<u32>)],
     eval: &E,
+    mut on_position: impl FnMut(usize, usize),
 ) -> McpFitResult {
     use std::collections::BTreeMap;
     // (phase_idx, h, d) -> (xs, ys).
     let mut groups: CellSamples = BTreeMap::new();
 
-    for s in positions {
+    for (i, s) in positions.iter().enumerate() {
+        // Ticks before the `continue`: the count is of positions tried.
+        on_position(i, positions.len());
         if s.is_terminal() {
             continue;
         }
@@ -525,7 +601,33 @@ pub fn run_mpc_fit(
     eval_weights: Option<&Path>,
     output: &Path,
 ) -> Result<McpFitResult> {
-    let positions = collect_positions(src, samples)?;
+    run_mpc_fit_observed(
+        cascade,
+        src,
+        samples,
+        eval_weights,
+        output,
+        |_| {},
+        |_, _| {},
+    )
+}
+
+/// [`run_mpc_fit`], reporting the corpus collection and the cascade fit
+/// separately — see [`run_fit_observed`] for why the two are not one count.
+///
+/// # Errors
+///
+/// Propagates corpus / I/O errors.
+pub fn run_mpc_fit_observed(
+    cascade: &[(u32, u32, Option<u32>)],
+    src: &Source,
+    samples: usize,
+    eval_weights: Option<&Path>,
+    output: &Path,
+    on_game: impl FnMut(usize),
+    on_position: impl FnMut(usize, usize),
+) -> Result<McpFitResult> {
+    let positions = collect_positions_observed(src, samples, on_game)?;
     if positions.is_empty() {
         bail!("no positions collected from the corpus");
     }
@@ -533,9 +635,9 @@ pub fn run_mpc_fit(
         Some(p) => {
             let w =
                 EvalWeights::load(p).map_err(|e| anyhow::anyhow!("load {}: {e}", p.display()))?;
-            fit_mpc_with(&positions, cascade, &PatternEval::new(w))
+            fit_mpc_with_observed(&positions, cascade, &PatternEval::new(w), on_position)
         }
-        None => fit_mpc_with(&positions, cascade, &BasicEval::default()),
+        None => fit_mpc_with_observed(&positions, cascade, &BasicEval::default(), on_position),
     };
     result.to_config().save_json(output)?;
     Ok(result)

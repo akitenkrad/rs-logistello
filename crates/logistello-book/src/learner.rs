@@ -597,6 +597,29 @@ impl Default for BookConfig {
 /// `cfg` (the exploration RNG is seeded from `cfg.seed`).
 #[must_use]
 pub fn learn_book<E: LeafEvaluator>(evaluator: &E, cfg: &BookConfig) -> OpeningBook {
+    learn_book_observed(evaluator, cfg, |_| {}, || {})
+}
+
+/// The same book, calling `on_game` once per finished self-play game and
+/// `on_move` once per move a game's search decides.
+///
+/// Both are offered because which one is the unit depends on
+/// `cfg.depth_limit`: exactly `cfg.num_games` games are played with no early
+/// exit, so games are a real total to open a bounded stage with, but one game
+/// is 0.05s at depth 6, 5.3s at depth 10 and over four minutes at depth 14
+/// (measured), and a count that moves once every few minutes is no better than
+/// none. `on_move` fires for every ply a search chose (a forced pass decides
+/// nothing and is not counted).
+///
+/// The back-propagation and the drawishness blend that follow the loop each
+/// walk the collected book once and are part of neither count.
+#[must_use]
+pub fn learn_book_observed<E: LeafEvaluator>(
+    evaluator: &E,
+    cfg: &BookConfig,
+    mut on_game: impl FnMut(u32),
+    mut on_move: impl FnMut(),
+) -> OpeningBook {
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
@@ -620,7 +643,16 @@ pub fn learn_book<E: LeafEvaluator>(evaluator: &E, cfg: &BookConfig) -> OpeningB
     let mut rng = ChaCha20Rng::seed_from_u64(cfg.seed);
 
     for game in 0..cfg.num_games {
-        self_play_one(evaluator, cfg, &engine_cfg, game, &mut rng, &mut book);
+        self_play_one(
+            evaluator,
+            cfg,
+            &engine_cfg,
+            game,
+            &mut rng,
+            &mut book,
+            &mut on_move,
+        );
+        on_game(game);
     }
 
     negamax_backpropagate(&mut book);
@@ -631,6 +663,7 @@ pub fn learn_book<E: LeafEvaluator>(evaluator: &E, cfg: &BookConfig) -> OpeningB
 /// Plays one self-play game and folds its booked `(position, move,
 /// final_eval)` triples into `book` (design doc §4.3.7 `SelfPlay` +
 /// `UpdateStatistics`).
+#[allow(clippy::too_many_arguments)]
 fn self_play_one<E: LeafEvaluator>(
     evaluator: &E,
     cfg: &BookConfig,
@@ -638,6 +671,7 @@ fn self_play_one<E: LeafEvaluator>(
     game: u32,
     rng: &mut rand_chacha::ChaCha20Rng,
     book: &mut OpeningBook,
+    on_move: &mut impl FnMut(),
 ) {
     use logistello_search::killer::KillerTable;
     use logistello_search::tt::TranspositionTable;
@@ -698,6 +732,10 @@ fn self_play_one<E: LeafEvaluator>(
         }
         state.apply_move(chosen).expect("chosen move is legal");
         ply += 1;
+        // Counted here and not in the forced-pass branch above: a pass decides
+        // nothing and costs nothing, and the searches are what the count is
+        // about.
+        on_move();
     }
 
     // final_eval = the game's terminal disc-difference, projected to each

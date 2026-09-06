@@ -9,6 +9,18 @@
 //! `--output` file and record nothing: what they make is an input to a later
 //! run, and it is that run that carries it (as a `Dataset` with the file's
 //! content hash).
+//!
+//! ## Progress
+//!
+//! Every subcommand here can be given flags that put it well past a minute —
+//! `play --depth 14` is over six minutes for one game, `bench-search
+//! --depth 19` is 3m24s for one search — so each one reports what it is doing
+//! at the granularity of its own work (`runvault::progress`). Lines go to
+//! standard error; standard output is untouched. A subcommand that opens a
+//! run reports through `Run::stage`, so its lines are mirrored into the run
+//! and stop when the manifest is sealed; one that produces only an artefact,
+//! and one whose work happens before `Run::start`, uses
+//! `Progress::to_stderr()` — there is no run directory to mirror into.
 
 use logistello_cli::edax::{EdaxConfig, EdaxGtpSession, GtpColor, resolve_edax_path};
 use logistello_cli::elo::{LevelResult, Outcome};
@@ -21,17 +33,19 @@ use logistello_cli::record;
 use logistello_cli::sweep;
 use logistello_cli::wthor_murakami::{self, fmt_algebraic as fmt_alg, parse_algebraic};
 
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use runvault::Run;
+use runvault::{Progress, Run, Stage};
 use serde_json::json;
 
-use logistello_book::{BookConfig, OpeningBook, learn_book};
+use logistello_book::{BookConfig, OpeningBook, learn_book_observed};
 use logistello_core::Zobrist;
-use logistello_core::perft::perft_standard;
+use logistello_core::perft::{perft_observed, perft_standard};
 use logistello_eval::{
     BaseFeatureSpec, DiscDiffEval, EvalWeights, GlemEval, GlemModel, LeafEvaluator,
 };
@@ -629,6 +643,104 @@ enum LeafChoice<'a> {
     Glem(&'a GlemEval),
 }
 
+/// The stage both players of one `play` game tick.
+///
+/// `GameEngine::run` takes the two players for the length of the game, so
+/// neither of them can borrow the caller's `Stage`; they share one and `main`
+/// takes it back to close it. `Player` is `Send` (the engine's batch runner is
+/// parallel), which is why this is an `Arc<Mutex<..>>` and not the
+/// `Rc<RefCell<..>>` the same shape uses where no such bound exists.
+type MoveObserver = Arc<Mutex<Option<Stage>>>;
+
+/// A [`CliPlayer`] that ticks a shared stage once per move it decides.
+///
+/// One game is the unit `play` reports at its end, and one game is minutes:
+/// the *move* is the unit inside it, and a move is exactly one call here.
+/// Forced passes are substituted by the engine without asking a player and so
+/// are not counted — the count is of decisions, which is where the time is.
+struct ObservedPlayer {
+    inner: CliPlayer,
+    moves: MoveObserver,
+}
+
+impl Player for ObservedPlayer {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn color(&self) -> Color {
+        self.inner.color()
+    }
+
+    fn select_move(&mut self, state: &GameState) -> Result<Move, othello_player::PlayerError> {
+        let m = self.inner.select_move(state)?;
+        if let Ok(mut guard) = self.moves.lock()
+            && let Some(stage) = guard.as_mut()
+        {
+            stage.tick();
+        }
+        Ok(m)
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+}
+
+/// How many leaf evaluations one tick of a search stage stands for.
+///
+/// A `Stage::tick` reads the clock, and a leaf evaluation is a few dozen
+/// nanoseconds, so ticking every leaf would tax the very benchmark
+/// `bench-search` exists to report. A block of a million lands several times a
+/// second at the rates measured here, which is far finer than the thirty
+/// seconds a stage may otherwise stay silent for.
+const LEAVES_PER_TICK: u64 = 1 << 20;
+
+/// A leaf evaluator that says how far a single search has got.
+///
+/// One `negascout` at `--depth 19` is 3m24s inside a single call, and the only
+/// unit below it is the node. There is no denominator for those — the tree is
+/// what the search is measuring — and splitting the root by hand would change
+/// the node count and the value the subcommand prints, which is the number
+/// being reported. So the stage is **unbounded** and counts leaf evaluations
+/// in blocks of [`LEAVES_PER_TICK`]: not a share of the work, but a rate, and
+/// a rate is what tells a reader that the search is running rather than
+/// wedged.
+///
+/// The wrapper returns `inner`'s value unchanged, so the evaluator is still
+/// the pure function of the position the search's minimax invariants need.
+struct ObservedEval<'a, E: LeafEvaluator> {
+    inner: &'a E,
+    seen: Cell<u64>,
+    stage: RefCell<Stage>,
+}
+
+impl<'a, E: LeafEvaluator> ObservedEval<'a, E> {
+    fn new(inner: &'a E, stage: Stage) -> Self {
+        Self {
+            inner,
+            seen: Cell::new(0),
+            stage: RefCell::new(stage),
+        }
+    }
+
+    /// The stage back, for the caller to close where the search ends.
+    fn into_stage(self) -> Stage {
+        self.stage.into_inner()
+    }
+}
+
+impl<E: LeafEvaluator> LeafEvaluator for ObservedEval<'_, E> {
+    fn eval(&self, state: &GameState) -> i32 {
+        let seen = self.seen.get() + 1;
+        self.seen.set(seen);
+        if seen.is_multiple_of(LEAVES_PER_TICK) {
+            self.stage.borrow_mut().tick();
+        }
+        self.inner.eval(state)
+    }
+}
+
 /// Builds a [`CliPlayer`] of the requested kind for `color`.
 ///
 /// `engine` -> [`LogistelloPlayer`] with `cfg` (using `PatternEval` /
@@ -888,6 +1000,7 @@ fn play_one_edax_game(
     sess: &mut EdaxGtpSession,
     our: &mut EngineReplay,
     our_color: Color,
+    on_ply: &mut impl FnMut(),
 ) -> Result<(u32, u32)> {
     use othello_player::Player;
     sess.new_game()
@@ -920,6 +1033,7 @@ fn play_one_edax_game(
             state
                 .apply_move(Move::Pass)
                 .map_err(|e| anyhow::anyhow!("apply forced pass: {e}"))?;
+            on_ply();
             continue;
         }
         if stm == our_color {
@@ -930,6 +1044,7 @@ fn play_one_edax_game(
             state
                 .apply_move(m)
                 .map_err(|e| anyhow::anyhow!("apply our move {alg}: {e}"))?;
+            on_ply();
         } else {
             let mv = sess
                 .genmove(gtp_color(stm))
@@ -947,6 +1062,7 @@ fn play_one_edax_game(
             state
                 .apply_move(parsed)
                 .map_err(|e| anyhow::anyhow!("apply edax move {mv:?}: {e}"))?;
+            on_ply();
         }
     }
     Ok((
@@ -1100,27 +1216,45 @@ fn main() -> Result<()> {
                 ),
                 None => None,
             };
-            let mut black_player = make_player(
-                &black,
-                Color::Black,
-                &cfg,
-                seed,
-                &leaf,
-                book_loaded.as_ref(),
-            )?;
-            let mut white_player = make_player(
-                &white,
-                Color::White,
-                &cfg,
-                seed,
-                &leaf,
-                book_loaded.as_ref(),
-            )?;
+            // The game is played before there is a run to mirror into (the
+            // run's parameters and metrics are the game's result), so the
+            // lines go to standard error only. The stage is unbounded: a
+            // game's length is not known until it is over — at most sixty
+            // placements, but how many of them are decisions rather than
+            // forced passes is what the game decides.
+            let moves_seen: MoveObserver = Arc::new(Mutex::new(Some(
+                Progress::to_stderr().unbounded_stage("moves"),
+            )));
+            let mut black_player = ObservedPlayer {
+                inner: make_player(
+                    &black,
+                    Color::Black,
+                    &cfg,
+                    seed,
+                    &leaf,
+                    book_loaded.as_ref(),
+                )?,
+                moves: Arc::clone(&moves_seen),
+            };
+            let mut white_player = ObservedPlayer {
+                inner: make_player(
+                    &white,
+                    Color::White,
+                    &cfg,
+                    seed,
+                    &leaf,
+                    book_loaded.as_ref(),
+                )?,
+                moves: Arc::clone(&moves_seen),
+            };
 
             let mut engine = GameEngine::new(GameEngineConfig::standard())?;
             let result = engine
                 .run(&mut black_player, &mut white_player)
                 .map_err(|e| anyhow::anyhow!("game engine error: {e}"))?;
+            if let Some(stage) = moves_seen.lock().ok().and_then(|mut g| g.take()) {
+                stage.close();
+            }
 
             let moves: Vec<String> = engine
                 .history()
@@ -1315,14 +1449,35 @@ fn main() -> Result<()> {
 
             // Single closure so every call site (full / single / mpc) uses
             // the same chosen evaluator without duplicating the match.
+            //
+            // Each call takes its **own** stage rather than sharing one over
+            // the whole subcommand: the three conditions of `--speedup` are
+            // the same search with pruning off, single ProbCut and
+            // Multi-ProbCut, which is a difference of orders of magnitude by
+            // construction — that is what the subcommand measures — so they
+            // are split and named after the condition instead of being
+            // weighted against a cost model nobody has before the run. What a
+            // stage counts is in `ObservedEval`.
             let bench_one = |root: &GameState,
                              depth: u32,
                              pc: ProbCutConfig,
-                             mc: MultiProbCutConfig|
+                             mc: MultiProbCutConfig,
+                             stage: Stage|
              -> (i32, u64, f64) {
                 match &glem_eval {
-                    Some(g) => bench_one_with(root, depth, g, pc, mc),
-                    None => bench_one_with(root, depth, &DiscDiffEval, pc, mc),
+                    Some(g) => {
+                        let observed = ObservedEval::new(g, stage);
+                        let out = bench_one_with(root, depth, &observed, pc, mc);
+                        observed.into_stage().close();
+                        out
+                    }
+                    None => {
+                        let disc_diff = DiscDiffEval;
+                        let observed = ObservedEval::new(&disc_diff, stage);
+                        let out = bench_one_with(root, depth, &observed, pc, mc);
+                        observed.into_stage().close();
+                        out
+                    }
                 }
             };
 
@@ -1336,6 +1491,7 @@ fn main() -> Result<()> {
                     depth,
                     ProbCutConfig::default(),
                     MultiProbCutConfig::default(),
+                    run.unbounded_stage("full"),
                 );
                 record::log_bench_condition(&mut run, "full", n_off, v_off)?;
                 println!("bench-search depth={depth} from_plies={from_plies} seed={seed}");
@@ -1347,7 +1503,13 @@ fn main() -> Result<()> {
                 // Single ProbCut.
                 let (n_single, single_done) = if probcut_params.is_some() {
                     let pc = build_probcut(true, false, probcut_t, probcut_params.as_ref())?;
-                    let (v, n, t) = bench_one(&root, depth, pc, MultiProbCutConfig::default());
+                    let (v, n, t) = bench_one(
+                        &root,
+                        depth,
+                        pc,
+                        MultiProbCutConfig::default(),
+                        run.unbounded_stage("single"),
+                    );
                     record::log_bench_condition(&mut run, "single", n, v)?;
                     let r = n as f64 / n_off.max(1) as f64;
                     println!(
@@ -1368,7 +1530,13 @@ fn main() -> Result<()> {
                 // Multi-ProbCut.
                 if mpc_params.is_some() {
                     let mc = build_multi_probcut(true, mpc_params.as_ref())?;
-                    let (v, n, t) = bench_one(&root, depth, ProbCutConfig::default(), mc);
+                    let (v, n, t) = bench_one(
+                        &root,
+                        depth,
+                        ProbCutConfig::default(),
+                        mc,
+                        run.unbounded_stage("mpc"),
+                    );
                     record::log_bench_condition(&mut run, "mpc", n, v)?;
                     let r_full = n as f64 / n_off.max(1) as f64;
                     println!(
@@ -1395,7 +1563,8 @@ fn main() -> Result<()> {
             } else {
                 let pc = build_probcut(probcut, no_probcut, probcut_t, probcut_params.as_ref())?;
                 let mc = build_multi_probcut(mpc, mpc_params.as_ref())?;
-                let (value, nodes, secs) = bench_one(&root, depth, pc, mc.clone());
+                let (value, nodes, secs) =
+                    bench_one(&root, depth, pc, mc.clone(), run.unbounded_stage("search"));
                 let pc_kind = if pc.enabled { "on" } else { "off" };
                 let mpc_kind = if mc.enabled { "on" } else { "off" };
                 let eval_kind = match &glem_model {
@@ -1422,6 +1591,7 @@ fn main() -> Result<()> {
             println!("results: {}", dir.display());
         }
         Command::Selfplay => {
+            // No stage: there is no work to report on yet.
             println!("selfplay: not yet implemented (Phase 4)");
         }
         Command::Extract {
@@ -1432,13 +1602,37 @@ fn main() -> Result<()> {
             max_empties_skip,
             output,
         } => {
+            // No run of its own (the `.pex1` is an input to a later one), so
+            // the lines go to standard error only. The shape of the stage
+            // comes from the source, because the two sources bound the loop
+            // differently: `--source selfplay` plays exactly `--games` games,
+            // while `--source wthor` also stops when the `.wtb` files run out
+            // — which is what the documented `--games 1000000` does — so
+            // `--games` there is a ceiling and not a total.
+            let progress = Progress::to_stderr();
             let records = match source.as_str() {
-                "selfplay" => extract::extract_selfplay(games, seed, max_empties_skip)?,
+                "selfplay" => {
+                    let mut stage = progress.stage("games", games);
+                    let r =
+                        extract::extract_selfplay_observed(games, seed, max_empties_skip, |_| {
+                            stage.tick()
+                        })?;
+                    stage.close();
+                    r
+                }
                 "wthor" => {
                     let dir = wthor_dir.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("--wthor-dir is required for --source wthor")
                     })?;
-                    extract::extract_wthor(dir, Some(games), max_empties_skip)?
+                    let mut stage = progress.unbounded_stage("games");
+                    let r = extract::extract_wthor_observed(
+                        dir,
+                        Some(games),
+                        max_empties_skip,
+                        |_| stage.tick(),
+                    )?;
+                    stage.close();
+                    r
                 }
                 other => bail!("unknown --source '{other}' (want selfplay|wthor)"),
             };
@@ -1461,13 +1655,35 @@ fn main() -> Result<()> {
         } => {
             let spec =
                 BaseFeatureSpec::parse(&base_features).map_err(|e| anyhow::anyhow!("{e}"))?;
+            // Same two shapes, and for the same reason, as `extract`.
+            let progress = Progress::to_stderr();
             let records = match source.as_str() {
-                "selfplay" => glem_extract::extract_selfplay(&spec, games, seed, max_empties_skip)?,
+                "selfplay" => {
+                    let mut stage = progress.stage("games", games);
+                    let r = glem_extract::extract_selfplay_observed(
+                        &spec,
+                        games,
+                        seed,
+                        max_empties_skip,
+                        |_| stage.tick(),
+                    )?;
+                    stage.close();
+                    r
+                }
                 "wthor" => {
                     let dir = wthor_dir.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("--wthor-dir is required for --source wthor")
                     })?;
-                    glem_extract::extract_wthor(&spec, dir, Some(games), max_empties_skip)?
+                    let mut stage = progress.unbounded_stage("games");
+                    let r = glem_extract::extract_wthor_observed(
+                        &spec,
+                        dir,
+                        Some(games),
+                        max_empties_skip,
+                        |_| stage.tick(),
+                    )?;
+                    stage.close();
+                    r
                 }
                 other => bail!("unknown --source '{other}' (want selfplay|wthor)"),
             };
@@ -1513,17 +1729,40 @@ fn main() -> Result<()> {
                 None => "basic".to_string(),
             };
 
+            // Two phases, counted separately, because the corpus is
+            // collected by replaying games (0.1s for a thousand of them) and
+            // the fit searches every collected position twice at the pair's
+            // depths — orders of magnitude apart, and a single count would
+            // extrapolate the first phase's rate onto the second. The corpus
+            // stage is unbounded: both sources stop as soon as `--samples`
+            // positions are in hand, so `--samples` games is a ceiling. The
+            // fit stage is bounded by the corpus that came out, which is why
+            // it is opened at the first position and not before.
+            let progress = Progress::to_stderr();
+            let mut corpus = progress.unbounded_stage("corpus");
+            let mut fit: Option<Stage> = None;
+            let mut on_position = |_i: usize, total: usize| {
+                fit.get_or_insert_with(|| progress.stage("fit", total))
+                    .tick();
+            };
+
             match &mpc_cascade {
                 // ---- Phase 6: Multi-ProbCut cascade fit ------------------
                 Some(spec) => {
                     let cascade = probcut_fit::parse_mpc_cascade(spec)?;
-                    let res = probcut_fit::run_mpc_fit(
+                    let res = probcut_fit::run_mpc_fit_observed(
                         &cascade,
                         &src,
                         samples,
                         eval_weights.as_deref(),
                         &output,
+                        |_| corpus.tick(),
+                        &mut on_position,
                     )?;
+                    corpus.close();
+                    if let Some(stage) = fit.take() {
+                        stage.close();
+                    }
                     println!(
                         "probcut-fit mpc-cascade={spec} source={source} \
                          samples<={samples} seed={seed} eval={eval_kind} \
@@ -1546,7 +1785,7 @@ fn main() -> Result<()> {
                 // ---- Phase 5: single-pair fit (unchanged) ----------------
                 None => {
                     let (d, h) = parse_pair(&single_pair)?;
-                    let res = probcut_fit::run_fit(
+                    let res = probcut_fit::run_fit_observed(
                         d,
                         h,
                         &src,
@@ -1554,7 +1793,13 @@ fn main() -> Result<()> {
                         eval_weights.as_deref(),
                         probcut_t,
                         &output,
+                        |_| corpus.tick(),
+                        &mut on_position,
                     )?;
+                    corpus.close();
+                    if let Some(stage) = fit.take() {
+                        stage.close();
+                    }
                     println!(
                         "probcut-fit single-pair={d}:{h} source={source} \
                          samples<={samples} seed={seed} eval={eval_kind} \
@@ -1571,6 +1816,10 @@ fn main() -> Result<()> {
             }
         }
         Command::MurakamiExtract { wthor_dir, output } => {
+            // No stage: this reads one WThor year and keeps the six
+            // Logistello-vs-Murakami games out of it (0.1s measured, and the
+            // whole published corpus would be seconds). There is no flag that
+            // scales it — the six games of the 1997 match are the fixture.
             let set = wthor_murakami::extract_murakami(&wthor_dir).map_err(|e| {
                 anyhow::anyhow!(
                     "murakami-extract from {}: {e} (did you run \
@@ -1651,6 +1900,16 @@ fn main() -> Result<()> {
                 ),
                 None => None,
             };
+            // The replay happens before there is a run to mirror into, so
+            // the lines go to standard error only. The unit is one scored
+            // Logistello decision — `pick` and `score`, two full searches —
+            // and not the game: the gold set is six games and the whole of it
+            // is 6m05s at `--depth 8` (measured), so a per-game count would
+            // move five times in six minutes. The number of decisions is not
+            // known first, because a game stops at its first unparsable or
+            // illegal recorded move, so the stage is unbounded.
+            let mut decisions = Progress::to_stderr().unbounded_stage("decisions");
+
             // One engine per colour (each owns its TT); replay_game resets.
             let mut all = Vec::new();
             for g in &set.games {
@@ -1661,8 +1920,15 @@ fn main() -> Result<()> {
                 };
                 let mut eng =
                     EngineReplay::build(color, &cfg, pattern.as_ref(), book_loaded.as_ref());
-                all.extend(match_replay::replay_game(g, &mut eng, main_lo, main_hi)?);
+                all.extend(match_replay::replay_game_observed(
+                    g,
+                    &mut eng,
+                    main_lo,
+                    main_hi,
+                    |_| decisions.tick(),
+                )?);
             }
+            decisions.close();
             let summary = match_replay::summarize(&all);
 
             // No RNG is drawn anywhere here: the recorded games are replayed
@@ -1786,11 +2052,26 @@ fn main() -> Result<()> {
             let cfg = phase9_engine_config(depth, endgame_empties, MultiProbCutConfig::default());
             let mut rows: Vec<LevelResult> = Vec::new();
             let t0 = Instant::now();
+            // The games run before there is a run to mirror into, so the
+            // lines go to standard error only. One stage per Edax level, and
+            // never one over all of them: an Edax level is its search depth,
+            // and one game measures 1.9s at level 5 / `--depth 8` against
+            // 44s at level 15 and 117s at level 20 / `--depth 12` — sixty
+            // times — so a single count would read the cheap level's rate
+            // onto the expensive one, which is the estimate this API exists
+            // not to make. Inside a level the unit is the **ply** and not the
+            // game, because at the documented sweep (levels 5,10,15,20 ×
+            // `--num-games-per-level 30`, `--depth 12`) a game is two minutes
+            // and a per-game count would sit still that long. How many plies
+            // a game takes is not known before it is played, so the stage is
+            // unbounded.
+            let progress = Progress::to_stderr();
             for &lvl in &levels {
                 let ecfg =
                     EdaxConfig::new(&path, lvl).with_timeout(std::time::Duration::from_secs(120));
                 let mut sess = EdaxGtpSession::start(&ecfg)
                     .map_err(|e| anyhow::anyhow!("start Edax level {lvl}: {e}"))?;
+                let mut plies = progress.unbounded_stage(&format!("level {lvl}"));
                 let mut lr = LevelResult::new(lvl);
                 for game_idx in 0..n {
                     // Alternate: even = our engine Black, odd = our White.
@@ -1800,7 +2081,8 @@ fn main() -> Result<()> {
                         Color::White
                     };
                     let mut eng = EngineReplay::build(our_color, &cfg, pattern.as_ref(), None);
-                    let (bd, wd) = play_one_edax_game(&mut sess, &mut eng, our_color)?;
+                    let (bd, wd) =
+                        play_one_edax_game(&mut sess, &mut eng, our_color, &mut || plies.tick())?;
                     let (our_d, edax_d) = if our_color == Color::Black {
                         (bd, wd)
                     } else {
@@ -1808,6 +2090,7 @@ fn main() -> Result<()> {
                     };
                     lr.record(Outcome::from_discs(our_d, edax_d));
                 }
+                plies.close();
                 println!(
                     "  level {lvl}: games={} W-D-L={}-{}-{} score_rate={:.4} \
                      win_rate={:.4} elo_delta={:+.1}",
@@ -1933,27 +2216,44 @@ fn main() -> Result<()> {
             };
             let mut sess =
                 EdaxGtpSession::start(&ecfg).map_err(|e| anyhow::anyhow!("start Edax: {e}"))?;
-            let mut idx = 0usize;
+            // The sampling loop runs before there is a run to mirror into,
+            // so the lines go to standard error only. `--positions` is a real
+            // total — the loop is `0..positions` and nothing stops it early —
+            // so the stage is bounded and its estimate is worth reading. Each
+            // position is one Edax self-play to terminal at `--edax-level`,
+            // which is where the time is and what `--edax-level` moves:
+            // 0.08s per position at level 5 and 1.7s at level 15 (measured),
+            // so a minute is 36 positions at level 15. The two skip paths are
+            // positions tried, so they tick as well — through the labelled
+            // block, which is what keeps a `continue` from bypassing the
+            // count — and the stage still closes at exactly 100%.
+            let mut sampled = Progress::to_stderr().stage("positions", positions);
             for k in 0..positions {
-                let plies = 8 + (k % 24);
-                let (st, line) = walk_line(plies, seed.wrapping_add(k as u64));
-                if st.is_terminal() || st.must_pass() {
-                    continue;
+                'position: {
+                    let plies = 8 + (k % 24);
+                    let (st, line) = walk_line(plies, seed.wrapping_add(k as u64));
+                    if st.is_terminal() || st.must_pass() {
+                        break 'position;
+                    }
+                    let Ok((bd, wd)) = edax_selfplay_from_line(&mut sess, &line) else {
+                        break 'position;
+                    };
+                    let edax_diff = match st.side_to_move {
+                        Color::Black => bd as i32 - wd as i32,
+                        Color::White => wd as i32 - bd as i32,
+                    };
+                    // The sample's index is how many were kept before it —
+                    // the skipped positions above never had one.
+                    let idx = samples.len();
+                    samples.push(CorrSample {
+                        idx,
+                        our_score: leaf_score(&st),
+                        edax_score: edax_diff,
+                    });
                 }
-                let Ok((bd, wd)) = edax_selfplay_from_line(&mut sess, &line) else {
-                    continue;
-                };
-                let edax_diff = match st.side_to_move {
-                    Color::Black => bd as i32 - wd as i32,
-                    Color::White => wd as i32 - bd as i32,
-                };
-                samples.push(CorrSample {
-                    idx,
-                    our_score: leaf_score(&st),
-                    edax_score: edax_diff,
-                });
-                idx += 1;
+                sampled.tick();
             }
+            sampled.close();
             let xs: Vec<f64> = samples.iter().map(|s| s.our_score as f64).collect();
             let ys: Vec<f64> = samples.iter().map(|s| s.edax_score as f64).collect();
             let r = eval_corr::pearson(&xs, &ys);
@@ -2033,14 +2333,60 @@ fn main() -> Result<()> {
                 max_book_plies,
                 endgame_empties: book_endgame_empties,
             };
+            // `learn-book` records nothing of its own — the book is an input
+            // to a later run — so the lines go to standard error only.
+            //
+            // Which unit is ticked comes from `--depth`, the way
+            // `hegselmann2005` took its denominator from the mean operator. A
+            // self-play game is 0.05s at `--depth 6` and 5.3s at `--depth 10`,
+            // where `0..num_games` is a real total with no early exit and the
+            // share of `--num-games` done is the thing worth knowing; but the
+            // same game is over four minutes at `--depth 14` (measured), and a
+            // count that moves once every few minutes is the silence this
+            // reporting exists to end. Past `GAME_TICK_MAX_DEPTH` the unit
+            // drops to the move — one search — and the stage becomes
+            // unbounded, because how many moves a game takes is not known
+            // before it is played.
+            const GAME_TICK_MAX_DEPTH: u32 = 12;
+            let progress = Progress::to_stderr();
+            let mut by_game =
+                (depth <= GAME_TICK_MAX_DEPTH).then(|| progress.stage("games", num_games as usize));
+            let mut by_move =
+                (depth > GAME_TICK_MAX_DEPTH).then(|| progress.unbounded_stage("moves"));
+            let mut on_game = |_| {
+                if let Some(stage) = by_game.as_mut() {
+                    stage.tick();
+                }
+            };
+            let mut on_move = || {
+                if let Some(stage) = by_move.as_mut() {
+                    stage.tick();
+                }
+            };
             let book = match &eval_weights {
                 Some(path) => {
                     let w = EvalWeights::load(path)
                         .map_err(|e| anyhow::anyhow!("load {}: {e}", path.display()))?;
-                    learn_book(&logistello_eval::PatternEval::new(w), &cfg)
+                    learn_book_observed(
+                        &logistello_eval::PatternEval::new(w),
+                        &cfg,
+                        &mut on_game,
+                        &mut on_move,
+                    )
                 }
-                None => learn_book(&logistello_eval::BasicEval::default(), &cfg),
+                None => learn_book_observed(
+                    &logistello_eval::BasicEval::default(),
+                    &cfg,
+                    &mut on_game,
+                    &mut on_move,
+                ),
             };
+            if let Some(stage) = by_game.take() {
+                stage.close();
+            }
+            if let Some(stage) = by_move.take() {
+                stage.close();
+            }
             book.save(&output)
                 .map_err(|e| anyhow::anyhow!("save {}: {e}", output.display()))?;
 
@@ -2161,7 +2507,22 @@ fn main() -> Result<()> {
             }
         }
         Command::Perft { depth } => {
-            let nodes = perft_standard(depth);
+            // One recursive call that says nothing until it returns: depth 11
+            // is 9.3s, depth 12 is over a minute and each further ply is
+            // roughly eight times the last. Splitting the top `SPLIT` plies
+            // gives a countable unit — one frontier subtree — and leaves the
+            // count untouched, and the number of those subtrees is
+            // `perft(SPLIT)`, which is 244 from the standard opening and
+            // costs nothing to work out first. So the stage is bounded and
+            // closes at exactly 100%.
+            const SPLIT: u32 = 4;
+            let split = depth.min(SPLIT);
+            let mut subtrees =
+                Progress::to_stderr().stage("subtrees", perft_standard(split) as usize);
+            let nodes = perft_observed(&GameState::standard_8x8(), depth, split, &mut || {
+                subtrees.tick();
+            });
+            subtrees.close();
             println!("perft(depth={depth}) = {nodes}");
         }
     }
