@@ -1,3 +1,115 @@
-# Metric descriptions are not written yet (MYTASK-3382). Until they are,
-# runvault records undeclared metrics instead of refusing them.
-require_docs = false
+# 指標が何を測っているか (runvault の宣言．rs-runvault docs/metrics.ja.md)．
+#
+# 名前は `crates/logistello-cli/src/main.rs` と `crates/logistello-cli/src/sweep.rs` が記録するものと一致していなければならない．
+#
+# `direction` は «値が大きいほど良いか»．模型の状態や到達量は成績ではないので
+# `none` とし，再現精度やキャッシュ効率のように評価方向が定まる量だけ `up` /
+# `down` とする．
+# `mean_<metric>` は軸の有限な返り値を展開して明示する．
+
+[metrics."black_score"]
+meaning   = "終局時の黒石の数"
+unit      = "count"
+direction = "none"
+range     = [0.0, 64.0]
+scope     = ["run"]
+
+[metrics."white_score"]
+meaning   = "終局時の白石の数"
+unit      = "count"
+direction = "none"
+range     = [0.0, 64.0]
+scope     = ["run"]
+
+[metrics."plies"]
+meaning   = "パスを含む記録済み着手数"
+unit      = "count"
+direction = "none"
+scope     = ["run"]
+
+[metrics."nodes"]
+meaning   = "探索したゲーム木ノード数"
+unit      = "count"
+direction = "down"
+scope     = ["run"]
+
+[metrics."search_value"]
+meaning   = "探索が返した手番側から見た局面評価値"
+unit      = "disc_score"
+direction = "none"
+scope     = ["run"]
+
+[metrics."scored_decisions"]
+meaning   = "棋譜でエンジンの選択と比較できた着手判断の数"
+unit      = "count"
+direction = "none"
+scope     = ["run"]
+
+[metrics."matched"]
+meaning   = "比較可能な着手判断のうちエンジンの選択と一致した数"
+unit      = "count"
+direction = "up"
+scope     = ["run"]
+
+[metrics."overall_match_rate"]
+meaning   = "比較可能な全着手判断に対する一致率"
+unit      = "ratio"
+direction = "up"
+range     = [0.0, 1.0]
+scope     = ["run"]
+
+[metrics."main_decisions"]
+meaning   = "主変化で比較できた着手判断の数"
+unit      = "count"
+direction = "none"
+scope     = ["run"]
+
+[metrics."main_matched"]
+meaning   = "主変化の着手判断のうちエンジンの選択と一致した数"
+unit      = "count"
+direction = "up"
+scope     = ["run"]
+
+[metrics."main_match_rate"]
+meaning   = "主変化の比較可能な着手判断に対する一致率"
+unit      = "ratio"
+direction = "up"
+range     = [0.0, 1.0]
+scope     = ["run"]
+
+[metrics."pearson_r"]
+meaning   = "エンジン評価値と Edax 評価値の Pearson 相関係数"
+unit      = "correlation"
+direction = "up"
+range     = [-1.0, 1.0]
+scope     = ["run"]
+
+[metrics."mean_nodes"]
+meaning   = "同じ掃引条件の試行にわたる探索ノード数の平均"
+unit      = "count"
+direction = "down"
+scope     = ["run"]
+
+[metrics."mean_eval_abs_err"]
+meaning   = "同じ掃引条件の試行にわたる評価絶対誤差の平均"
+unit      = "disc_score"
+direction = "down"
+scope     = ["run"]
+
+[metrics."mean_n_features"]
+meaning   = "同じ掃引条件の試行にわたる GLEM 特徴数の平均"
+unit      = "count"
+direction = "none"
+scope     = ["run"]
+
+[metrics."mean_book_positions"]
+meaning   = "同じ掃引条件の試行にわたる学習済み定石局面数の平均"
+unit      = "count"
+direction = "none"
+scope     = ["run"]
+
+[metrics."mean_selfplay_score"]
+meaning   = "同じ掃引条件の試行にわたる自己対局スコアの平均"
+unit      = "disc_score"
+direction = "none"
+scope     = ["run"]
