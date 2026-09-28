@@ -202,7 +202,7 @@ fn tiny_sweep(
         ..Default::default()
     };
     let resolved = spec.resolve().unwrap();
-    let (parent, rows) = run_sweep(&resolved, &root).unwrap();
+    let (parent, rows) = run_sweep(&resolved, &root, false).unwrap();
     (root, parent, rows)
 }
 
@@ -306,7 +306,7 @@ fn determinism_trial_events_identical_across_runs() {
             ..Default::default()
         };
         let r = spec.resolve().unwrap();
-        let (parent, _) = run_sweep(&r, &root).unwrap();
+        let (parent, _) = run_sweep(&r, &root, false).unwrap();
         let mut trials = BTreeMap::new();
         for child in children_of(&parent) {
             let value = run_parameters(&child)["value"]
@@ -393,7 +393,7 @@ fn metric_degenerate_single_point_grid_works() {
     assert_eq!(r.points.len(), 1);
     let root = std::env::temp_dir().join(format!("logi_sweep_one_{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
-    let (parent, rows) = run_sweep(&r, &root).unwrap();
+    let (parent, rows) = run_sweep(&r, &root, false).unwrap();
     assert_eq!(rows.len(), 2, "1 condition × 2 runs");
     // One condition ⇒ one child, and the child is where the numbers are:
     // the parent measures nothing.

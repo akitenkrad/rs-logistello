@@ -276,8 +276,10 @@ pub fn options(
     domain: &str,
     results_root: &Path,
     replication: Replication,
+    scratch: bool,
 ) -> RunOptions {
     RunOptions::new(EXPERIMENT, subcommand)
+        .scratch(scratch)
         .repo_id(REPO_ID)
         .domain(domain)
         .results_root(results_root)

@@ -67,6 +67,9 @@ use othello_player::{GreedyPlayer, Player, RandomPlayer};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Development run: write it under results/_scratch/ so it is never synced to the vault.
+    #[arg(long, global = true)]
+    scratch: bool,
     /// Root the runvault run directories are created under. Every
     /// measuring subcommand writes into `<root>/logistello/<run-slug>/`;
     /// runvault owns the naming.
@@ -1160,6 +1163,7 @@ fn main() -> Result<()> {
     let Cli {
         command,
         results_root,
+        scratch,
     } = Cli::parse();
 
     match command {
@@ -1350,6 +1354,7 @@ fn main() -> Result<()> {
                     record::DOMAIN_SIMULATION,
                     &results_root,
                     record::replication_play(),
+                    scratch,
                 )
                 .parameters(&parameters)
                 .context("runvault: parameters の組み立てに失敗")?
@@ -1438,6 +1443,7 @@ fn main() -> Result<()> {
                     record::DOMAIN_SIMULATION,
                     &results_root,
                     record::replication_bench_search(),
+                    scratch,
                 )
                 .parameters(&parameters)
                 .context("runvault: parameters の組み立てに失敗")?
@@ -1959,6 +1965,7 @@ fn main() -> Result<()> {
                     record::DOMAIN_ANALYSIS,
                     &results_root,
                     record::replication_match_replay(),
+                    scratch,
                 )
                 .parameters(&parameters)
                 .context("runvault: parameters の組み立てに失敗")?
@@ -2129,6 +2136,7 @@ fn main() -> Result<()> {
                     record::DOMAIN_ANALYSIS,
                     &results_root,
                     record::replication_elo_vs_edax(),
+                    scratch,
                 )
                 .parameters(&parameters)
                 .context("runvault: parameters の組み立てに失敗")?
@@ -2276,6 +2284,7 @@ fn main() -> Result<()> {
                     record::DOMAIN_SIMULATION,
                     &results_root,
                     record::replication_eval_correlation(),
+                    scratch,
                 )
                 .parameters(&parameters)
                 .context("runvault: parameters の組み立てに失敗")?
@@ -2473,7 +2482,7 @@ fn main() -> Result<()> {
                 resolved.points.len(),
                 resolved.points.len() * runs as usize,
             );
-            let (parent_dir, rows) = sweep::run_sweep(&resolved, &results_root)?;
+            let (parent_dir, rows) = sweep::run_sweep(&resolved, &results_root, scratch)?;
             println!(
                 "sweep parent: {} ({} conditions, {} trials)",
                 parent_dir.display(),

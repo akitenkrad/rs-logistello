@@ -1016,11 +1016,14 @@ fn trial_event(axis: Axis, row: &MetricRow, index: u32) -> serde_json::Value {
 /// here has no time axis: it is a single measurement, so the whole trial fits
 /// in one event row and needs no `metrics.csv` of its own.
 ///
+/// `scratch` comes from the CLI's `--scratch`; the parent and every child share it.
+///
 /// # Errors
 /// Run creation, event or metric writing failure.
 pub fn run_sweep(
     resolved: &ResolvedSweep,
     results_root: &Path,
+    scratch: bool,
 ) -> Result<(std::path::PathBuf, Vec<MetricRow>)> {
     let replication = record::replication_sweep(resolved.axis.col());
     let parameters = SweepParameters::from_resolved(resolved);
@@ -1030,6 +1033,7 @@ pub fn run_sweep(
             record::DOMAIN_SIMULATION,
             results_root,
             replication.clone(),
+            scratch,
         )
         .parameters(&parameters)
         .context("runvault: sweep の parameters の組み立てに失敗")?
@@ -1058,6 +1062,7 @@ pub fn run_sweep(
                 record::DOMAIN_SIMULATION,
                 results_root,
                 replication.clone(),
+                scratch,
             )
             .parameters(&point_parameters)
             .context("runvault: 子 run の parameters の組み立てに失敗")?
